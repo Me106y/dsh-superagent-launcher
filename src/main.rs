@@ -51,6 +51,13 @@ struct Instance {
     running: bool,
 }
 
+/// A line under the toolbar: a recent result, or an error that stays until dismissed.
+struct Message {
+    text: String,
+    at: Instant,
+    sticky: bool,
+}
+
 /// Progress of the background "add a repository" job.
 enum Msg {
     Step(String),
@@ -663,6 +670,54 @@ fn agent_login(cli: &str) -> Option<String> {
     (!login.is_empty()).then_some(login)
 }
 
+/// Refuse a repository the agent cannot push to, before a profile is created for it.
+///
+/// The plugin runs the same check when the source is saved, but by then the profile already exists and the
+/// instance sits there unconfigured. Asking the agent's own `gh` first keeps the failure where the user can
+/// still fix the input.
+fn preflight_repository(repo: &str, cli: &str, t: &i18n::Texts) -> Result<(), String> {
+    let agent = agent_login(cli).unwrap_or_else(|| cli.to_string());
+    let output = Command::new(cli)
+        .args([
+            "api",
+            &format!("repos/{repo}"),
+            "--jq",
+            "if .permissions.push then \"push\" else \"no-push\" end",
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(fill(
+            t.repo_unreachable,
+            &[("repo", repo), ("agent", &agent)],
+        ));
+    }
+    let verdict = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if verdict != "push" {
+        return Err(format!(
+            "{} {}",
+            fill(t.agent_no_push, &[("repo", repo), ("agent", &agent)]),
+            t.bind_hint
+        ));
+    }
+    Ok(())
+}
+
+/// Bind a repository to a profile that was created earlier, before the permission existed.
+fn bind_existing(
+    port: u16,
+    profile: &str,
+    repo: &str,
+    cli: &str,
+    lang: LangKind,
+) -> Result<String, String> {
+    let t = i18n::texts(lang);
+    preflight_repository(repo, cli, t)?;
+    bind_repository(port, repo, cli, &|_| {})?;
+    bind_executor(port)?;
+    Ok(fill(t.bind_ok, &[("repo", repo), ("profile", profile)]))
+}
+
 /// The whole "add a repository" job, run off the UI thread.
 /// `Result` carries the text shown when it finishes.
 fn add_repository(
@@ -677,6 +732,7 @@ fn add_repository(
     if cli.is_empty() {
         return Err(t.no_agent_cli.to_string());
     }
+    preflight_repository(&repo, &cli, t)?;
     let human = who.join(", ");
     let progress = |step: &str| {
         let _ = tx.send(Msg::Step(step.to_string()));
@@ -742,7 +798,7 @@ struct App {
     frames: u32,
     instances: Vec<Instance>,
     pending: Option<(String, u16, Instant)>,
-    message: Option<(String, Instant)>,
+    message: Option<Message>,
     last_scan: Instant,
     new_repo: String,
     new_who: String,
@@ -750,6 +806,8 @@ struct App {
     job_status: String,
     editing: Option<String>,
     edit_allowed: String,
+    binding: Option<String>,
+    bind_repo: String,
     theme: theme::ThemeChoice,
     lang: i18n::Lang,
     cjk: bool,
@@ -788,6 +846,8 @@ impl App {
             job_status: String::new(),
             editing: None,
             edit_allowed: String::new(),
+            binding: None,
+            bind_repo: String::new(),
             theme: saved.theme,
             lang: saved.lang,
             cjk: fonts::available(),
@@ -816,7 +876,21 @@ impl App {
     }
 
     fn notify(&mut self, text: impl Into<String>) {
-        self.message = Some((text.into(), Instant::now()));
+        self.message = Some(Message {
+            text: text.into(),
+            at: Instant::now(),
+            sticky: false,
+        });
+    }
+
+    /// A failure stays on screen until the next action: the useful part is often a long
+    /// server sentence explaining which account or repository is wrong.
+    fn notify_error(&mut self, text: impl Into<String>) {
+        self.message = Some(Message {
+            text: text.into(),
+            at: Instant::now(),
+            sticky: true,
+        });
     }
 
     /// Take job messages without holding a borrow while mutating the app.
@@ -841,7 +915,7 @@ impl App {
                 self.last_scan = Instant::now();
                 match result {
                     Ok(text) => self.notify(text),
-                    Err(text) => self.notify(text),
+                    Err(text) => self.notify_error(text),
                 }
             }
             None => self.job = Some(receiver),
@@ -923,6 +997,9 @@ impl eframe::App for App {
         let mut configure: Option<(String, String)> = None;
         let mut save_edit: Option<String> = None;
         let mut cancel_edit = false;
+        let mut bind_clicked: Option<(String, u16)> = None;
+        let mut cancel_bind = false;
+        let mut dismiss_message = false;
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(4.0);
@@ -1061,6 +1138,30 @@ impl eframe::App for App {
                                         .on_hover_text(t.configure_hint);
                                 }
                             });
+                            if instance.repo == "not configured" {
+                                if self.binding.as_deref() == Some(instance.profile.as_str()) {
+                                    ui.horizontal(|ui| {
+                                        ui.label(t.repo_label).on_hover_text(t.repo_tooltip);
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.bind_repo)
+                                                .hint_text(t.repo_hint)
+                                                .desired_width(260.0),
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        if ui.button(t.bind_repo).clicked() {
+                                            bind_clicked =
+                                                Some((instance.profile.clone(), instance.port));
+                                        }
+                                        if ui.button(t.cancel).clicked() {
+                                            cancel_bind = true;
+                                        }
+                                    });
+                                } else if ui.button(t.bind_repo).clicked() {
+                                    self.binding = Some(instance.profile.clone());
+                                    self.bind_repo.clear();
+                                }
+                            }
                             if self.editing.as_deref() == Some(instance.profile.as_str()) {
                                 ui.horizontal(|ui| {
                                     ui.label(t.who_label).on_hover_text(t.who_tooltip);
@@ -1149,12 +1250,27 @@ impl eframe::App for App {
                     self.instances = discover();
                     self.last_scan = Instant::now();
                 }
-                if let Some((text, at)) = &self.message {
-                    if at.elapsed() < Duration::from_secs(10) {
-                        ui.label(egui::RichText::new(text).small());
-                    }
-                }
             });
+            if let Some(message) = &self.message {
+                if message.sticky || message.at.elapsed() < Duration::from_secs(10) {
+                    ui.horizontal_wrapped(|ui| {
+                        let color = if message.sticky {
+                            palette.error
+                        } else {
+                            palette.weak
+                        };
+                        ui.label(egui::RichText::new(&message.text).small().color(color));
+                        if message.sticky
+                            && ui
+                                .small_button(egui::RichText::new("✕").small())
+                                .on_hover_text(t.dismiss)
+                                .clicked()
+                        {
+                            dismiss_message = true;
+                        }
+                    });
+                }
+            }
         });
 
         if add_clicked {
@@ -1194,6 +1310,32 @@ impl eframe::App for App {
                     });
                 }
             }
+        }
+
+        if dismiss_message {
+            self.message = None;
+        }
+
+        if let Some((profile, port)) = bind_clicked {
+            let repo = self.bind_repo.trim().to_string();
+            if !valid_repo(&repo) {
+                self.notify_error(t.invalid_repo);
+            } else if self.agent_cli.is_empty() {
+                self.notify_error(t.no_agent_cli);
+            } else {
+                let (sender, receiver) = mpsc::channel();
+                self.job = Some(receiver);
+                self.job_status = t.working.into();
+                self.binding = None;
+                let cli = self.agent_cli.clone();
+                thread::spawn(move || {
+                    let result = bind_existing(port, &profile, &repo, &cli, lang);
+                    let _ = sender.send(Msg::Done(result));
+                });
+            }
+        }
+        if cancel_bind {
+            self.binding = None;
         }
 
         if let Some((profile, allowed)) = configure {

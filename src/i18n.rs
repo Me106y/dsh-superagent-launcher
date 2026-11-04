@@ -121,6 +121,12 @@ pub struct Texts {
     pub invalid_login: &'static str,
     pub working: &'static str,
     pub not_ready: &'static str,
+    pub bind_repo: &'static str,
+    pub bind_ok: &'static str,
+    pub agent_no_push: &'static str,
+    pub repo_unreachable: &'static str,
+    pub bind_hint: &'static str,
+    pub dismiss: &'static str,
 }
 
 pub fn texts(kind: LangKind) -> &'static Texts {
@@ -177,6 +183,12 @@ static EN: Texts = Texts {
     invalid_login: "{login} is not a GitHub login",
     working: "working…",
     not_ready: "{profile} did not become ready on :{port}; see {log}",
+    bind_repo: "Bind repository",
+    bind_ok: "{repo} is now bound to {profile}",
+    agent_no_push: "{agent} cannot push to {repo}.",
+    repo_unreachable: "{repo} does not exist, or {agent} cannot see it.",
+    bind_hint: "Invite the agent account as a collaborator on GitHub, accept the invite, then bind again.",
+    dismiss: "Dismiss",
 };
 
 static ZH: Texts = Texts {
@@ -226,6 +238,12 @@ static ZH: Texts = Texts {
     invalid_login: "{login} 不是合法的 GitHub 登录名",
     working: "处理中…",
     not_ready: "{profile} 没能在 :{port} 就绪，见 {log}",
+    bind_repo: "绑定仓库",
+    bind_ok: "{repo} 已绑定到 {profile}",
+    agent_no_push: "agent 账号 {agent} 对 {repo} 没有 push 权限。",
+    repo_unreachable: "仓库 {repo} 不存在，或 agent 账号 {agent} 看不到它。",
+    bind_hint: "先在 GitHub 上把 agent 账号加为 collaborator 并接受邀请，然后重新绑定。",
+    dismiss: "关闭",
 };
 
 #[cfg(test)]
