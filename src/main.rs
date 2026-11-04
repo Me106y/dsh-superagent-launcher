@@ -9,9 +9,10 @@
 //! * The port lives in `<profile>/cordis.patch.yml` under the `webserver` row.
 //! * The repository does **not** live in YAML. It is panel state, stored in `<stateDir>/orchestrator.sqlite`
 //!   under the newest `settings-version:N` key. Reading that table is what lets a stopped instance still show
-//!   its repository, so this binary shells out to `/usr/bin/sqlite3` instead of linking SQLite.
-//!   `-readonly` cannot be used: the plugin keeps the database in WAL mode, and a read-only connection has no
-//!   `-shm` to attach to once the process is gone. A normal connection with a busy timeout reads safely.
+//!   its repository, so this binary links SQLite instead of shelling out to `/usr/bin/sqlite3`, which several
+//!   Linux distributions do not ship. A read-only connection cannot be used: the plugin keeps the database in
+//!   WAL mode, and a read-only connection has no `-shm` to attach to once the process is gone. A normal
+//!   connection with a busy timeout reads safely.
 //! * Binding a repository is a plugin operation, not a file edit: `PUT /orchestrator/api/settings/source:github`
 //!   runs the plugin's own setup check (repository readable, agent account can push) and restarts it. Adding a
 //!   repository any other way would skip that check.
@@ -20,7 +21,8 @@
 //! tool should do (redistribution). Labels stay short and technical.
 
 use eframe::egui;
-use serde_json::{json, Value};
+use i18n::{LangKind, fill};
+use serde_json::{Value, json};
 use std::{
     fs::{self, File},
     net::{SocketAddr, TcpStream},
@@ -30,6 +32,12 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+mod fonts;
+mod i18n;
+mod platform;
+mod settings;
+mod theme;
 
 /// A profile that mounts dsh-superagent.
 #[derive(Clone)]
@@ -63,29 +71,8 @@ fn profiles_dir() -> PathBuf {
     dsh_home().join("profiles")
 }
 
-fn logs_dir() -> PathBuf {
-    home().join("Library/Logs")
-}
-
-fn install_dir() -> PathBuf {
-    home().join("Library/Application Support/DeepSeekHarness/runtime")
-}
-
-fn dsh_bin() -> PathBuf {
-    install_dir().join("node_modules/@deepseek-ai/dsh/lib/bin.js")
-}
-
-fn node_bin() -> PathBuf {
-    for candidate in ["/usr/local/bin/node", "/opt/homebrew/bin/node"] {
-        if Path::new(candidate).exists() {
-            return PathBuf::from(candidate);
-        }
-    }
-    PathBuf::from("node")
-}
-
 fn log_for(profile: &str) -> PathBuf {
-    logs_dir().join(format!("dsh-superagent-{profile}.log"))
+    platform::logs_dir().join(format!("dsh-superagent-{profile}.log"))
 }
 
 /// Read one scalar out of a `- id: <id>` block in a cordis patch file.
@@ -99,7 +86,11 @@ fn block_scalar(text: &str, id: &str, key: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("- id:") {
-            current = Some(rest.trim().trim_matches(|c| c == '"' || c == '\'').to_string());
+            current = Some(
+                rest.trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string(),
+            );
             continue;
         }
         if current.as_deref() == Some(id) {
@@ -124,7 +115,10 @@ fn set_block_scalar(text: &str, id: &str, key: &str, value: &str) -> Option<Stri
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("- id:") {
-            current = rest.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+            current = rest
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string();
         }
         if current == id && !replaced && trimmed.starts_with(&prefix) {
             let indent = &line[..line.len() - line.trim_start().len()];
@@ -146,27 +140,18 @@ fn settings_from_db(state_dir: &Path) -> Option<(String, String)> {
     }
     // One row per saved block: `source:github` holds the repository, `policy` holds the allowed list.
     // Reading only the newest row would break as soon as policy is saved after the source.
-    let output = Command::new("/usr/bin/sqlite3")
-        .args([
-            "-cmd",
-            ".timeout 1500",
-            db.to_str()?,
-            "select value from kv where key like 'settings-version:%';",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Ok(parsed) = serde_json::from_str::<Value>(line) else {
+    for line in platform::kv_values(&db) {
+        let Ok(parsed) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         if parsed["block"] != "source:github" {
             continue;
         }
         let config = &parsed["settings"]["sources"]["github"]["config"];
-        let repo = config["repository"].as_str().unwrap_or_default().to_string();
+        let repo = config["repository"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let cli = config["cli"].as_str().unwrap_or_default().to_string();
         if !repo.is_empty() {
             return Some((repo, cli));
@@ -178,22 +163,8 @@ fn settings_from_db(state_dir: &Path) -> Option<(String, String)> {
 /// Policy stores "who may ask for work" in its own row: `settings.policy.sources.github.allowed`.
 fn allowed_from_db(state_dir: &Path) -> Vec<String> {
     let db = state_dir.join("orchestrator.sqlite");
-    let Some(db) = db.to_str() else {
-        return Vec::new();
-    };
-    let Ok(output) = Command::new("/usr/bin/sqlite3")
-        .args([
-            "-cmd",
-            ".timeout 1500",
-            db,
-            "select value from kv where key like 'settings-version:%';",
-        ])
-        .output()
-    else {
-        return Vec::new();
-    };
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Ok(parsed) = serde_json::from_str::<Value>(line) else {
+    for line in platform::kv_values(&db) {
+        let Ok(parsed) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         if parsed["block"] != "policy" {
@@ -241,7 +212,8 @@ fn discover() -> Vec<Instance> {
         let state_dir = block_scalar(&patch, "dsh-superagent", "stateDir")
             .map(PathBuf::from)
             .unwrap_or_else(|| dsh_home().join("state").join(&name));
-        let (repo, cli) = settings_from_db(&state_dir).unwrap_or_else(|| ("not configured".into(), String::new()));
+        let (repo, cli) = settings_from_db(&state_dir)
+            .unwrap_or_else(|| ("not configured".into(), String::new()));
         let allowed = allowed_from_db(&state_dir);
         found.push(Instance {
             profile: name,
@@ -263,10 +235,14 @@ fn start(profile: &str) -> Result<(), String> {
     if let Some(parent) = log.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let out = File::create(&log).map_err(|error| format!("cannot write {}: {error}", log.display()))?;
+    let out =
+        File::create(&log).map_err(|error| format!("cannot write {}: {error}", log.display()))?;
     let err = out.try_clone().map_err(|error| error.to_string())?;
-    Command::new(node_bin())
-        .arg(dsh_bin())
+    let entry = platform::dsh_entry().ok_or_else(|| {
+        "cannot find the DeepSeek Harness install (set DSH_INSTALL_DIR to its runtime directory)".to_string()
+    })?;
+    Command::new(platform::node_bin())
+        .arg(entry)
         .arg("--profile")
         .arg(profile)
         .arg("--no-open")
@@ -282,7 +258,7 @@ fn start(profile: &str) -> Result<(), String> {
 fn last_token(profile: &str) -> Option<String> {
     let candidates = [
         log_for(profile),
-        logs_dir().join("dsh-superagent.log"),
+        platform::logs_dir().join("dsh-superagent.log"),
         dsh_home().join("state").join(profile).join("launch.log"),
     ];
     for path in candidates {
@@ -308,7 +284,7 @@ fn open_panel(profile: &str, port: u16) {
         Some(token) => format!("http://127.0.0.1:{port}/?token={token}"),
         None => format!("http://127.0.0.1:{port}/"),
     };
-    let _ = Command::new("/usr/bin/open").arg(url).spawn();
+    platform::open_url(&url);
 }
 
 /// SIGTERM, never SIGKILL: the plugin releases its state-directory lock on a clean exit.
@@ -316,7 +292,7 @@ fn open_panel(profile: &str, port: u16) {
 /// The port is only a hint. Before signalling, the process command line must actually name this profile,
 /// so a port reused by something else is never killed by mistake.
 fn stop(port: u16, profile: &str) {
-    let Ok(output) = Command::new("/usr/sbin/lsof")
+    let Ok(output) = Command::new("lsof")
         .args(["-ti", &format!("tcp:{port}")])
         .output()
     else {
@@ -324,7 +300,7 @@ fn stop(port: u16, profile: &str) {
     };
     let marker = format!("--profile {profile}");
     for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-        let Ok(command) = Command::new("/bin/ps")
+        let Ok(command) = Command::new("ps")
             .args(["-p", pid, "-o", "command="])
             .output()
         else {
@@ -334,14 +310,19 @@ fn stop(port: u16, profile: &str) {
         if !command.contains(&marker) {
             continue;
         }
-        let _ = Command::new("/bin/kill").args(["-TERM", pid]).status();
+        let _ = Command::new("kill").args(["-TERM", pid]).status();
     }
 }
 
 /// Call the plugin's management API. The header is the same-origin marker the plugin requires.
-fn api_call(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String), String> {
+fn api_call(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<(u16, String), String> {
     let url = format!("http://127.0.0.1:{port}/orchestrator/api/{path}");
-    let mut command = Command::new("/usr/bin/curl");
+    let mut command = Command::new("curl");
     command.args([
         "-sS",
         "--max-time",
@@ -359,8 +340,13 @@ fn api_call(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<(
     command.args(["-w", "\n__STATUS__%{http_code}", &url]);
     let output = command.output().map_err(|error| error.to_string())?;
     let text = String::from_utf8_lossy(&output.stdout).to_string();
-    let (rest, status) = text.rsplit_once("__STATUS__").ok_or("unexpected curl output")?;
-    let code = status.trim().parse::<u16>().map_err(|_| "unexpected status".to_string())?;
+    let (rest, status) = text
+        .rsplit_once("__STATUS__")
+        .ok_or("unexpected curl output")?;
+    let code = status
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "unexpected status".to_string())?;
     Ok((code, rest.trim_end().to_string()))
 }
 
@@ -382,15 +368,89 @@ fn valid_repo(repo: &str) -> bool {
     !owner.is_empty()
         && !name.is_empty()
         && !name.contains('/')
-        && repo.chars().all(|c| {
-            c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/'
+        && repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
+}
+
+/// The gh wrapper signed in as the agent account.
+///
+/// Deployment decides this once: `DSH_SUPERAGENT_AGENT_CLI`, the CLI an existing profile already uses, the
+/// wrapper the setup guide installs, and finally any other `gh-*` wrapper in `~/.local/bin`.
+fn detect_agent_cli(instances: &[Instance]) -> String {
+    if let Some(value) = std::env::var_os("DSH_SUPERAGENT_AGENT_CLI") {
+        let value = value.to_string_lossy().into_owned();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    if let Some(cli) = instances
+        .iter()
+        .map(|instance| instance.cli.as_str())
+        .find(|cli| !cli.is_empty())
+    {
+        return cli.to_string();
+    }
+    let bin = platform::home().join(".local/bin");
+    let wrapper = bin.join("gh-agent");
+    if wrapper.is_file() {
+        return wrapper.display().to_string();
+    }
+    let mut wrappers: Vec<PathBuf> = fs::read_dir(&bin)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("gh-"))
+                })
+                .filter(|path| path.is_file())
+                .collect()
         })
+        .unwrap_or_default();
+    wrappers.sort();
+    wrappers
+        .into_iter()
+        .next()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default()
+}
+
+/// Split the "who may ask" field: commas, spaces or newlines, duplicates dropped.
+fn parse_logins(text: &str) -> Vec<String> {
+    let mut logins: Vec<String> = Vec::new();
+    for part in text.split(|c: char| c == ',' || c.is_whitespace()) {
+        let login = part.trim();
+        if login.is_empty() || logins.iter().any(|seen| seen.eq_ignore_ascii_case(login)) {
+            continue;
+        }
+        logins.push(login.to_string());
+    }
+    logins
+}
+
+/// GitHub logins are alphanumeric with single hyphens inside, at most 39 characters.
+fn valid_login(login: &str) -> bool {
+    let length = login.chars().count();
+    (1..=39).contains(&length)
+        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !login.starts_with('-')
+        && !login.ends_with('-')
+        && !login.contains("--")
 }
 
 fn slug_for(repo: &str) -> String {
     let tail: String = repo
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     format!("superagent-{tail}")
 }
@@ -403,7 +463,11 @@ fn next_free_port(instances: &[Instance]) -> u16 {
 }
 
 /// Copy an existing profile, then point it at a new port and a new state directory.
-fn create_profile(template: &str, repo: &str, progress: &dyn Fn(&str)) -> Result<(String, u16), String> {
+fn create_profile(
+    template: &str,
+    repo: &str,
+    progress: &dyn Fn(&str),
+) -> Result<(String, u16), String> {
     let name = slug_for(repo);
     let source = profiles_dir().join(template);
     let target = profiles_dir().join(&name);
@@ -418,7 +482,7 @@ fn create_profile(template: &str, repo: &str, progress: &dyn Fn(&str)) -> Result
     let port = next_free_port(&discover());
 
     progress("copying the profile");
-    let copied = Command::new("/bin/cp")
+    let copied = Command::new("cp")
         .args(["-a"])
         .arg(&source)
         .arg(&target)
@@ -431,18 +495,27 @@ fn create_profile(template: &str, repo: &str, progress: &dyn Fn(&str)) -> Result
     progress("writing port and state directory");
     let manifest_path = target.join("package.json");
     let manifest = fs::read_to_string(&manifest_path).map_err(|error| error.to_string())?;
-    let mut manifest_json: Value = serde_json::from_str(&manifest).map_err(|error| error.to_string())?;
+    let mut manifest_json: Value =
+        serde_json::from_str(&manifest).map_err(|error| error.to_string())?;
     manifest_json["name"] = json!(format!("dsh-profile-{name}"));
-    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest_json).unwrap_or(manifest))
-        .map_err(|error| error.to_string())?;
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest_json).unwrap_or(manifest),
+    )
+    .map_err(|error| error.to_string())?;
 
     let patch_path = target.join("cordis.patch.yml");
     let patch = fs::read_to_string(&patch_path).map_err(|error| error.to_string())?;
     let state_dir = dsh_home().join("state").join(&name);
     let patch = set_block_scalar(&patch, "webserver", "port", &port.to_string())
         .ok_or("the template has no webserver port row")?;
-    let patch = set_block_scalar(&patch, "dsh-superagent", "stateDir", &state_dir.display().to_string())
-        .ok_or("the template has no dsh-superagent stateDir row")?;
+    let patch = set_block_scalar(
+        &patch,
+        "dsh-superagent",
+        "stateDir",
+        &state_dir.display().to_string(),
+    )
+    .ok_or("the template has no dsh-superagent stateDir row")?;
     fs::write(&patch_path, patch).map_err(|error| error.to_string())?;
     fs::create_dir_all(&state_dir).map_err(|error| error.to_string())?;
 
@@ -450,7 +523,12 @@ fn create_profile(template: &str, repo: &str, progress: &dyn Fn(&str)) -> Result
 }
 
 /// Bind the repository through the plugin's own settings API, which runs the setup check and restarts it.
-fn bind_repository(port: u16, repo: &str, cli: &str, progress: &dyn Fn(&str)) -> Result<(), String> {
+fn bind_repository(
+    port: u16,
+    repo: &str,
+    cli: &str,
+    progress: &dyn Fn(&str),
+) -> Result<(), String> {
     progress("reading current settings");
     let (status, body) = api_call(port, "GET", "settings", None)?;
     if status != 200 {
@@ -483,9 +561,8 @@ fn bind_repository(port: u16, repo: &str, cli: &str, progress: &dyn Fn(&str)) ->
     Err(format!("binding rejected (HTTP {status}): {detail}"))
 }
 
-/// Save the two account settings of a running instance: who may ask, and which CLI acts as the agent.
-/// The CLI change goes through the plugin's setup check, which may restart it.
-fn save_accounts(port: u16, allowed: &[String], cli: &str) -> Result<(), String> {
+/// Save who may ask on a running instance.
+fn save_accounts(port: u16, allowed: &[String]) -> Result<(), String> {
     let (status, body) = api_call(port, "GET", "settings", None)?;
     if status != 200 {
         return Err(format!("settings read failed: HTTP {status} {body}"));
@@ -509,22 +586,6 @@ fn save_accounts(port: u16, allowed: &[String], cli: &str) -> Result<(), String>
     let (status, body) = api_call(port, "PUT", "settings/policy", Some(&payload))?;
     if status != 200 {
         return Err(format!("policy rejected (HTTP {status}): {body}"));
-    }
-
-    let source = settings["sources"]
-        .as_array()
-        .and_then(|sources| sources.iter().find(|source| source["id"] == "github"))
-        .ok_or("the plugin exposes no GitHub source")?;
-    let current = source["value"]["config"]["cli"].as_str().unwrap_or_default();
-    if !cli.is_empty() && cli != current {
-        let revision = source["revision"].as_i64().unwrap_or(0);
-        let mut value = source["value"].clone();
-        value["config"]["cli"] = json!(cli);
-        let payload = json!({ "value": value, "revision": revision }).to_string();
-        let (status, body) = api_call(port, "PUT", "settings/source:github", Some(&payload))?;
-        if status != 200 {
-            return Err(format!("agent cli rejected (HTTP {status}): {body}"));
-        }
     }
     Ok(())
 }
@@ -563,7 +624,7 @@ fn bind_executor(port: u16) -> Result<(), String> {
 
 /// Policy decides who may ask the agent for work. It is independent of repository access, so it is
 /// written before the repository is bound: a failed binding still leaves a usable policy behind.
-fn bind_policy(port: u16, login: &str) -> Result<(), String> {
+fn bind_policy(port: u16, allowed: &[String]) -> Result<(), String> {
     let (status, body) = api_call(port, "GET", "settings", None)?;
     if status != 200 {
         return Err(format!("settings read failed: HTTP {status} {body}"));
@@ -575,7 +636,8 @@ fn bind_policy(port: u16, login: &str) -> Result<(), String> {
     if !value.is_object() {
         value = json!({ "rules": [], "sources": {} });
     }
-    value["sources"]["github"]["allowed"] = json!([{ "id": login }]);
+    let list: Vec<Value> = allowed.iter().map(|login| json!({ "id": login })).collect();
+    value["sources"]["github"]["allowed"] = json!(list);
     let payload = json!({ "value": value, "revision": revision }).to_string();
     let (status, body) = api_call(port, "PUT", "settings/policy", Some(&payload))?;
     if status == 200 {
@@ -607,35 +669,45 @@ fn add_repository(
     template: String,
     repo: String,
     cli: String,
-    human: String,
+    who: Vec<String>,
+    lang: LangKind,
     tx: Sender<Msg>,
 ) -> Result<String, String> {
+    let t = i18n::texts(lang);
+    if cli.is_empty() {
+        return Err(t.no_agent_cli.to_string());
+    }
+    let human = who.join(", ");
     let progress = |step: &str| {
         let _ = tx.send(Msg::Step(step.to_string()));
     };
-    progress("creating a profile");
+    progress(t.step_create);
     let (profile, port) = create_profile(&template, &repo, &progress)?;
 
-    progress("starting it");
+    progress(t.step_start);
     start(&profile)?;
     if !wait_ready(port, &profile, Duration::from_secs(60)) {
-        return Err(format!(
-            "{profile} did not become ready on {port}; see {}",
-            log_for(&profile).display()
+        return Err(fill(
+            t.not_ready,
+            &[
+                ("profile", &profile),
+                ("port", &port.to_string()),
+                ("log", &log_for(&profile).display().to_string()),
+            ],
         ));
     }
 
-    progress(&format!("allowing {human} to ask for work"));
-    bind_policy(port, &human)?;
+    progress(&fill(t.step_allow, &[("who", &human)]));
+    bind_policy(port, &who)?;
 
-    progress("binding the repository");
+    progress(t.step_bind);
     bind_repository(port, &repo, &cli, &progress)?;
 
-    progress("configuring the per-ticket checkout");
+    progress(t.step_checkout);
     bind_executor(port)?;
 
     // The plugin restarts after a successful save; wait for the port to answer again before opening it.
-    progress("waiting for the restart");
+    progress(t.step_restart);
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         if is_listening(port) {
@@ -644,49 +716,103 @@ fn add_repository(
         thread::sleep(Duration::from_millis(500));
     }
     open_panel(&profile, port);
-    let agent = agent_login(&cli).unwrap_or_else(|| "the configured account".into());
-    Ok(format!(
-        "{repo} added as {profile} on :{port} — agent {agent}, requester {human}"
+    let agent = agent_login(&cli).unwrap_or_else(|| cli.clone());
+    Ok(fill(
+        t.added,
+        &[
+            ("repo", &repo),
+            ("profile", &profile),
+            ("port", &port.to_string()),
+            ("agent", &agent),
+            ("human", &human),
+        ],
     ))
 }
 
+/// How this launch differs from the saved preferences, used by `--screenshot` and by hand.
+#[derive(Clone, Default)]
+struct Launch {
+    screenshot: Option<PathBuf>,
+    theme: Option<theme::ThemeChoice>,
+    lang: Option<i18n::Lang>,
+}
+
 struct App {
+    screenshot: Option<PathBuf>,
+    frames: u32,
     instances: Vec<Instance>,
     pending: Option<(String, u16, Instant)>,
     message: Option<(String, Instant)>,
     last_scan: Instant,
     new_repo: String,
-    new_cli: String,
-    new_human: String,
+    new_who: String,
     job: Option<Receiver<Msg>>,
     job_status: String,
     editing: Option<String>,
     edit_allowed: String,
-    edit_cli: String,
+    theme: theme::ThemeChoice,
+    lang: i18n::Lang,
+    cjk: bool,
+    cjk_checked: bool,
+    dark: bool,
+    applied: Option<theme::ThemeChoice>,
+    agent_cli: String,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(launch: Launch) -> Self {
         let instances = discover();
-        let cli = instances
+        let mut saved = settings::load();
+        if let Some(theme) = launch.theme {
+            saved.theme = theme;
+        }
+        if let Some(lang) = launch.lang {
+            saved.lang = lang;
+        }
+        let who = instances
             .iter()
-            .map(|instance| instance.cli.clone())
-            .find(|cli| !cli.is_empty())
+            .find(|instance| !instance.allowed.is_empty())
+            .map(|instance| instance.allowed.join(", "))
             .unwrap_or_default();
+        let agent_cli = detect_agent_cli(&instances);
         Self {
+            screenshot: launch.screenshot,
+            frames: 0,
             instances,
             pending: None,
             message: None,
             last_scan: Instant::now(),
             new_repo: String::new(),
-            new_cli: cli,
-            new_human: "Me106y".into(),
+            new_who: who,
             job: None,
             job_status: String::new(),
             editing: None,
             edit_allowed: String::new(),
-            edit_cli: String::new(),
+            theme: saved.theme,
+            lang: saved.lang,
+            cjk: fonts::available(),
+            cjk_checked: false,
+            dark: true,
+            applied: None,
+            agent_cli,
         }
+    }
+
+    /// The language the labels are drawn in. `System` follows the locale; without a CJK font, English.
+    fn language(&self) -> LangKind {
+        let kind = self.lang.resolve();
+        if kind == LangKind::Zh && !self.cjk {
+            LangKind::En
+        } else {
+            kind
+        }
+    }
+
+    fn save_preferences(&self) {
+        settings::save(settings::Settings {
+            theme: self.theme,
+            lang: self.lang,
+        });
     }
 
     fn notify(&mut self, text: impl Into<String>) {
@@ -725,6 +851,26 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // `Auto` follows the desktop scheme; reapplying only on change keeps egui's animations intact.
+        let ctx = ui.ctx().clone();
+        if self.applied != Some(self.theme) {
+            theme::apply(&ctx, self.theme);
+            self.applied = Some(self.theme);
+        }
+        let dark = ctx.theme() == egui::Theme::Dark;
+        self.dark = dark;
+        let palette = theme::palette(dark);
+        // A font file that exists may still lack the glyphs; check once, on the first frame.
+        if !self.cjk_checked {
+            self.cjk = self.cjk
+                && ctx.fonts_mut(|fonts| {
+                    fonts.has_glyphs(&egui::FontId::proportional(14.0), "中文仓库")
+                });
+            self.cjk_checked = true;
+        }
+        let lang = self.language();
+        let t = i18n::texts(lang);
+
         self.poll_job();
 
         // Cheap liveness refresh every second, full re-discovery less often.
@@ -740,11 +886,33 @@ impl eframe::App for App {
         if let Some((profile, port, at)) = self.pending.clone() {
             if is_listening(port) && last_token(&profile).is_some() {
                 open_panel(&profile, port);
-                self.notify(format!("{profile} is up on {port}; opening the panel"));
+                self.notify(fill(
+                    t.opened,
+                    &[("profile", &profile), ("port", &port.to_string())],
+                ));
                 self.pending = None;
             } else if at.elapsed() > Duration::from_secs(45) {
-                self.notify(format!("{profile} did not open port {port} in 45s; see the log"));
+                self.notify(fill(
+                    t.open_timeout,
+                    &[("profile", &profile), ("port", &port.to_string())],
+                ));
                 self.pending = None;
+            }
+        }
+
+        if let Some(path) = self.screenshot.clone() {
+            self.frames += 1;
+            if self.frames == 12 {
+                let context = ctx.clone();
+                ctx.request_screenshot(move |image| {
+                    if let Err(error) = save_png(&path, &image) {
+                        eprintln!("screenshot failed: {error}");
+                    }
+                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                });
+            }
+            if self.frames > 120 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
 
@@ -752,44 +920,73 @@ impl eframe::App for App {
 
         let mut action: Option<(&'static str, String, u16)> = None;
         let mut add_clicked = false;
-        let mut configure: Option<(String, String, String)> = None;
+        let mut configure: Option<(String, String)> = None;
         let mut save_edit: Option<String> = None;
         let mut cancel_edit = false;
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(4.0);
-            ui.heading("DSH Superagent");
-            ui.label(
-                egui::RichText::new("Profiles that mount dsh-superagent. Nothing starts at login.")
-                    .weak()
-                    .small(),
-            );
+            ui.horizontal(|ui| {
+                ui.heading("DSH Superagent");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Right-to-left: the first widget added ends up rightmost.
+                    if self.cjk {
+                        let (next, label) = match lang {
+                            LangKind::Zh => (i18n::Lang::En, "EN"),
+                            LangKind::En => (i18n::Lang::Zh, "中文"),
+                        };
+                        if ui
+                            .button(egui::RichText::new(label).small())
+                            .on_hover_text("切换界面语言 / Switch language")
+                            .clicked()
+                        {
+                            self.lang = next;
+                            self.save_preferences();
+                        }
+                        ui.add_space(8.0);
+                    }
+                    for (choice, index) in [
+                        (theme::ThemeChoice::Dark, 2),
+                        (theme::ThemeChoice::Light, 1),
+                        (theme::ThemeChoice::System, 0),
+                    ] {
+                        if ui
+                            .selectable_label(
+                                self.theme == choice,
+                                egui::RichText::new(t.theme_labels[index]).small(),
+                            )
+                            .clicked()
+                        {
+                            self.theme = choice;
+                            self.save_preferences();
+                        }
+                    }
+                });
+            });
+            ui.label(egui::RichText::new(t.subtitle).weak().small());
             ui.add_space(6.0);
 
             if self.instances.is_empty() {
                 ui.colored_label(
-                    egui::Color32::from_rgb(200, 120, 60),
-                    format!(
-                        "No profile mounts dsh-superagent under {}",
-                        profiles_dir().display()
+                    palette.warn,
+                    fill(
+                        t.no_profiles,
+                        &[("profiles", &profiles_dir().display().to_string())],
                     ),
                 );
             }
 
             egui::ScrollArea::vertical()
-                .max_height(260.0)
+                .max_height(250.0)
                 .show(ui, |ui| {
                     for instance in self.instances.clone() {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.strong(&instance.profile);
                                 if instance.running {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(40, 170, 110),
-                                        "running",
-                                    );
+                                    ui.colored_label(palette.accent, t.running);
                                 } else {
-                                    ui.colored_label(egui::Color32::GRAY, "stopped");
+                                    ui.colored_label(palette.weak, t.stopped);
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -799,11 +996,30 @@ impl eframe::App for App {
                                 );
                             });
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("repo").weak().small());
-                                ui.monospace(&instance.repo);
+                                ui.label(egui::RichText::new(t.repository).weak().small());
+                                let repository = if instance.repo == "not configured" {
+                                    t.not_configured
+                                } else {
+                                    &instance.repo
+                                };
+                                ui.monospace(repository);
                             });
+                            if !instance.cli.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(t.agent_cli).weak().small());
+                                    ui.monospace(&instance.cli);
+                                });
+                            }
+                            if !instance.allowed.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(t.who_may_ask).weak().small());
+                                    ui.label(
+                                        egui::RichText::new(instance.allowed.join(", ")).small(),
+                                    );
+                                });
+                            }
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("state").weak().small());
+                                ui.label(egui::RichText::new(t.state_dir).weak().small());
                                 ui.label(
                                     egui::RichText::new(instance.state_dir.display().to_string())
                                         .small()
@@ -813,106 +1029,110 @@ impl eframe::App for App {
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 if ui
-                                    .add_enabled(instance.running, egui::Button::new("Open panel"))
+                                    .add_enabled(instance.running, egui::Button::new(t.open_panel))
                                     .clicked()
                                 {
-                                    action = Some(("open", instance.profile.clone(), instance.port));
+                                    action =
+                                        Some(("open", instance.profile.clone(), instance.port));
                                 }
                                 if ui
-                                    .add_enabled(!instance.running, egui::Button::new("Start"))
+                                    .add_enabled(!instance.running, egui::Button::new(t.start))
                                     .clicked()
                                 {
-                                    action = Some(("start", instance.profile.clone(), instance.port));
+                                    action =
+                                        Some(("start", instance.profile.clone(), instance.port));
                                 }
                                 if ui
-                                    .add_enabled(instance.running, egui::Button::new("Stop"))
+                                    .add_enabled(instance.running, egui::Button::new(t.stop))
                                     .clicked()
                                 {
-                                    action = Some(("stop", instance.profile.clone(), instance.port));
+                                    action =
+                                        Some(("stop", instance.profile.clone(), instance.port));
+                                }
+                                if instance.running {
+                                    if ui.button(t.configure).clicked() {
+                                        configure = Some((
+                                            instance.profile.clone(),
+                                            instance.allowed.join(", "),
+                                        ));
+                                    }
+                                } else {
+                                    ui.add_enabled(false, egui::Button::new(t.configure))
+                                        .on_hover_text(t.configure_hint);
                                 }
                             });
+                            if self.editing.as_deref() == Some(instance.profile.as_str()) {
                                 ui.horizontal(|ui| {
-                                    if instance.running {
-                                        if ui.button("Configure").clicked() {
-                                            configure = Some((
-                                                instance.profile.clone(),
-                                                instance.allowed.join(", "),
-                                                instance.cli.clone(),
-                                            ));
-                                        }
-                                    } else {
-                                        ui.add_enabled(false, egui::Button::new("Configure"))
-                                            .on_hover_text("start it to edit");
+                                    ui.label(t.who_label).on_hover_text(t.who_tooltip);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.edit_allowed)
+                                            .hint_text(t.who_hint)
+                                            .desired_width(280.0),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button(t.save).clicked() {
+                                        save_edit = Some(instance.profile.clone());
+                                    }
+                                    if ui.button(t.cancel).clicked() {
+                                        cancel_edit = true;
                                     }
                                 });
-                                if self.editing.as_deref() == Some(instance.profile.as_str()) {
-                                    ui.horizontal(|ui| {
-                                        ui.label("allow");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut self.edit_allowed)
-                                                .hint_text("logins that may ask for work, comma separated")
-                                                .desired_width(300.0),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("cli");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut self.edit_cli)
-                                                .hint_text("gh wrapper signed in as the agent")
-                                                .desired_width(300.0),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Save accounts").clicked() {
-                                            save_edit = Some(instance.profile.clone());
-                                        }
-                                        if ui.button("Cancel").clicked() {
-                                            cancel_edit = true;
-                                        }
-                                    });
-                                }
+                            }
                         });
                         ui.add_space(4.0);
                     }
                 });
 
             ui.separator();
-            ui.label(egui::RichText::new("Add a repository").strong());
-            ui.label(
-                egui::RichText::new(
-                    "Creates a new profile on a free port, starts it, then binds the repository through the plugin's own setup check.",
-                )
-                .weak()
-                .small(),
-            );
+            ui.label(egui::RichText::new(t.add_title).strong());
+            ui.label(egui::RichText::new(t.add_description).weak().small());
+            ui.add_space(2.0);
+            egui::Grid::new("add-repository")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label(t.repo_label).on_hover_text(t.repo_tooltip);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_repo)
+                            .hint_text(t.repo_hint)
+                            .desired_width(300.0),
+                    );
+                    ui.end_row();
+
+                    ui.label(t.who_label).on_hover_text(t.who_tooltip);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_who)
+                            .hint_text(t.who_hint)
+                            .desired_width(300.0),
+                    );
+                    ui.end_row();
+                });
             ui.horizontal(|ui| {
-                ui.label("owner/name");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_repo)
-                        .hint_text("acme/widgets")
-                        .desired_width(240.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("allow login");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_human)
-                        .hint_text("the account allowed to ask for work")
-                        .desired_width(240.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("gh cli");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_cli)
-                        .hint_text("path to the agent's gh wrapper")
-                        .desired_width(320.0),
-                );
+                ui.label(egui::RichText::new(t.agent_cli).weak().small());
+                if self.agent_cli.is_empty() {
+                    ui.label(
+                        egui::RichText::new(t.no_agent_cli)
+                            .small()
+                            .color(palette.warn),
+                    );
+                } else {
+                    ui.monospace(&self.agent_cli)
+                        .on_hover_text("Everything the agent writes appears under this account.");
+                }
             });
             ui.horizontal(|ui| {
                 let busy = self.job.is_some();
                 if ui
-                    .add_enabled(!busy, egui::Button::new("Add and start"))
+                    .add_enabled(
+                        !busy && !self.agent_cli.is_empty(),
+                        egui::Button::new(
+                            egui::RichText::new(t.add_and_start)
+                                .color(palette.on_accent)
+                                .strong(),
+                        )
+                        .fill(palette.accent),
+                    )
                     .clicked()
                 {
                     add_clicked = true;
@@ -925,7 +1145,7 @@ impl eframe::App for App {
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Refresh").clicked() {
+                if ui.button(t.refresh).clicked() {
                     self.instances = discover();
                     self.last_scan = Instant::now();
                 }
@@ -939,34 +1159,46 @@ impl eframe::App for App {
 
         if add_clicked {
             let repo = self.new_repo.trim().to_string();
-            let cli = self.new_cli.trim().to_string();
-            let human = self.new_human.trim().to_string();
-            let template = self.instances.first().map(|instance| instance.profile.clone());
+            let who = parse_logins(&self.new_who);
+            let template = self
+                .instances
+                .first()
+                .map(|instance| instance.profile.clone());
+            let invalid = who.iter().find(|login| !valid_login(login)).cloned();
             match template {
-                None => self.notify("add needs one existing profile to copy from"),
-                Some(_template) if !valid_repo(&repo) => {
-                    self.notify("repository must look like owner/name")
+                None => self.notify(t.need_template),
+                Some(_) if !valid_repo(&repo) => self.notify(t.invalid_repo),
+                Some(_) if who.is_empty() => self.notify(fill(t.invalid_login, &[("login", "")])),
+                Some(_) if invalid.is_some() => self.notify(fill(
+                    t.invalid_login,
+                    &[("login", invalid.as_deref().unwrap_or_default())],
+                )),
+                Some(_)
+                    if self
+                        .instances
+                        .iter()
+                        .any(|instance| instance.repo.eq_ignore_ascii_case(&repo)) =>
+                {
+                    self.notify(fill(t.already_configured, &[("repo", &repo)]))
                 }
-                Some(_template) if self.instances.iter().any(|i| i.repo.eq_ignore_ascii_case(&repo)) => {
-                    self.notify(format!("{repo} is already configured"))
-                }
+                Some(_) if self.agent_cli.is_empty() => self.notify(t.no_agent_cli),
                 Some(template) => {
                     let (sender, receiver) = mpsc::channel();
                     self.job = Some(receiver);
-                    self.job_status = "starting".into();
+                    self.job_status = t.working.into();
                     let tx = sender.clone();
+                    let cli = self.agent_cli.clone();
                     thread::spawn(move || {
-                        let result = add_repository(template, repo, cli, human, tx.clone());
+                        let result = add_repository(template, repo, cli, who, lang, tx.clone());
                         let _ = tx.send(Msg::Done(result));
                     });
                 }
             }
         }
 
-        if let Some((profile, allowed, cli)) = configure {
+        if let Some((profile, allowed)) = configure {
             self.editing = Some(profile);
             self.edit_allowed = allowed;
-            self.edit_cli = cli;
         }
         if cancel_edit {
             self.editing = None;
@@ -974,23 +1206,26 @@ impl eframe::App for App {
         if let Some(profile) = save_edit {
             if let Some(instance) = self.instances.iter().find(|i| i.profile == profile) {
                 let port = instance.port;
-                let allowed: Vec<String> = self
-                    .edit_allowed
-                    .split(',')
-                    .map(|login| login.trim().to_string())
-                    .filter(|login| !login.is_empty())
-                    .collect();
-                let cli = self.edit_cli.trim().to_string();
-                let (sender, receiver) = mpsc::channel();
-                self.job = Some(receiver);
-                self.job_status = "saving accounts".into();
-                self.editing = None;
-                let tx = sender.clone();
-                thread::spawn(move || {
-                    let result = save_accounts(port, &allowed, &cli)
-                        .map(|()| format!("accounts saved for {profile}"));
-                    let _ = tx.send(Msg::Done(result));
-                });
+                let allowed = parse_logins(&self.edit_allowed);
+                let invalid = allowed.iter().find(|login| !valid_login(login)).cloned();
+                if allowed.is_empty() || invalid.is_some() {
+                    self.notify(fill(
+                        t.invalid_login,
+                        &[("login", invalid.as_deref().unwrap_or_default())],
+                    ));
+                } else {
+                    let (sender, receiver) = mpsc::channel();
+                    self.job = Some(receiver);
+                    self.job_status = t.working.into();
+                    self.editing = None;
+                    let tx = sender.clone();
+                    let profile = profile.clone();
+                    thread::spawn(move || {
+                        let result = save_accounts(port, &allowed)
+                            .map(|()| fill(t.accounts_saved, &[("profile", &profile)]));
+                        let _ = tx.send(Msg::Done(result));
+                    });
+                }
             }
         }
 
@@ -998,18 +1233,48 @@ impl eframe::App for App {
             Some(("open", profile, port)) => open_panel(&profile, port),
             Some(("start", profile, port)) => match start(&profile) {
                 Ok(()) => {
-                    self.notify(format!("starting {profile}…"));
+                    self.notify(fill(t.starting, &[("profile", &profile)]));
                     self.pending = Some((profile, port, Instant::now()));
                 }
                 Err(error) => self.notify(error),
             },
             Some(("stop", profile, port)) => {
                 stop(port, &profile);
-                self.notify(format!("stopping {profile} (SIGTERM)"));
+                self.notify(fill(t.stopping, &[("profile", &profile)]));
             }
             _ => {}
         }
     }
+}
+
+/// Write a screenshot as an 8-bit RGBA PNG, the format the README images use.
+fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let file = File::create(path).map_err(|error| error.to_string())?;
+    let mut encoder = png::Encoder::new(
+        std::io::BufWriter::new(file),
+        image.size[0] as u32,
+        image.size[1] as u32,
+    );
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity(image.pixels.len() * 4);
+    for pixel in &image.pixels {
+        bytes.extend_from_slice(&pixel.to_array());
+    }
+    writer
+        .write_image_data(&bytes)
+        .map_err(|error| error.to_string())
+}
+
+fn arg_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|argument| argument == flag)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
 }
 
 fn main() -> eframe::Result<()> {
@@ -1020,28 +1285,45 @@ fn main() -> eframe::Result<()> {
                 "{}\t:{}\t{}\t{}\t{}\tallow={}",
                 instance.profile,
                 instance.port,
-                if instance.running { "running" } else { "stopped" },
+                if instance.running {
+                    "running"
+                } else {
+                    "stopped"
+                },
                 instance.repo,
                 instance.cli,
-                if instance.allowed.is_empty() { "-".to_string() } else { instance.allowed.join(",") }
+                if instance.allowed.is_empty() {
+                    "-".to_string()
+                } else {
+                    instance.allowed.join(",")
+                }
             );
         }
         return Ok(());
     }
 
-    // `--accounts <port> <logins> <cli>` saves the two account settings headlessly.
+    // `--diagnose` prints the resolved preferences and the detected agent CLI, for bug reports.
+    if std::env::args().any(|argument| argument == "--diagnose") {
+        let saved = settings::load();
+        println!(
+            "theme={} lang={:?} cjk={} agent_cli={}",
+            saved.theme.stored(),
+            saved.lang.resolve(),
+            fonts::available(),
+            detect_agent_cli(&discover())
+        );
+        return Ok(());
+    }
+
+    // `--accounts <port> <logins>` saves who may ask, headlessly.
     if let Some(index) = std::env::args().position(|argument| argument == "--accounts") {
         let mut rest = std::env::args().skip(index + 1);
-        let port = rest.next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(0);
-        let allowed: Vec<String> = rest
+        let port = rest
             .next()
-            .unwrap_or_default()
-            .split(',')
-            .map(|login| login.trim().to_string())
-            .filter(|login| !login.is_empty())
-            .collect();
-        let cli = rest.next().unwrap_or_default();
-        match save_accounts(port, &allowed, &cli) {
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(0);
+        let allowed = parse_logins(&rest.next().unwrap_or_default());
+        match save_accounts(port, &allowed) {
             Ok(()) => println!("accounts saved on :{port}"),
             Err(text) => {
                 eprintln!("{text}");
@@ -1051,7 +1333,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    // `--add owner/name` runs the same job without the window, for smoke tests.
+    // `--add owner/name [--allow a,b]` runs the same job without the window, for smoke tests.
     if let Some(index) = std::env::args().position(|argument| argument == "--add") {
         let repo = std::env::args().nth(index + 1).unwrap_or_default();
         let instances = discover();
@@ -1059,16 +1341,14 @@ fn main() -> eframe::Result<()> {
             .first()
             .map(|instance| instance.profile.clone())
             .unwrap_or_default();
-        let cli = instances
-            .first()
-            .map(|instance| instance.cli.clone())
-            .unwrap_or_default();
-        let human = std::env::args()
+        let cli = detect_agent_cli(&instances);
+        let who = std::env::args()
             .position(|argument| argument == "--allow")
             .and_then(|index| std::env::args().nth(index + 1))
-            .unwrap_or_else(|| "Me106y".to_string());
+            .map(|value| parse_logins(&value))
+            .unwrap_or_default();
         let (tx, _rx) = mpsc::channel();
-        match add_repository(template, repo, cli, human, tx) {
+        match add_repository(template, repo, cli, who, LangKind::En, tx) {
             Ok(text) => println!("{text}"),
             Err(text) => {
                 eprintln!("{text}");
@@ -1078,15 +1358,36 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let args: Vec<String> = std::env::args().collect();
+    let launch = Launch {
+        screenshot: arg_value(&args, "--screenshot").map(PathBuf::from),
+        theme: arg_value(&args, "--theme").and_then(|value| theme::ThemeChoice::parse(&value)),
+        lang: arg_value(&args, "--lang").and_then(|value| i18n::Lang::parse(&value)),
+    };
+    let capturing = launch.screenshot.is_some();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([680.0, 680.0])
-            .with_min_inner_size([560.0, 480.0]),
+            // The capture runs at zoom 2, so the window must be twice the logical size.
+            .with_inner_size(if capturing {
+                [1320.0, 1010.0]
+            } else {
+                [680.0, 720.0]
+            })
+            .with_min_inner_size([560.0, 480.0])
+            .with_app_id("dsh-superagent-launcher"),
         ..Default::default()
     };
     eframe::run_native(
         "DSH Superagent",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(move |cc| {
+            if capturing {
+                // 2x for a README image that stays sharp on a high-density display.
+                cc.egui_ctx.set_zoom_factor(2.0);
+            }
+            fonts::install(&cc.egui_ctx);
+            Ok(Box::new(App::new(launch)))
+        }),
     )
 }

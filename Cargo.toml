@@ -6,3 +6,8 @@ edition = "2024"
 [dependencies]
 eframe = "0.37.0"
 serde_json = "1.0.154"
+# Bundled SQLite: the plugin keeps its state in WAL mode and several distributions ship no `sqlite3`
+# command, so the launcher links its own copy instead of shelling out to `/usr/bin/sqlite3`.
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+# Only used by `--screenshot`, which captures the window for the README.
+png = "0.18"
