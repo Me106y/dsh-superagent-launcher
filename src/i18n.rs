@@ -127,6 +127,7 @@ pub struct Texts {
     pub repo_unreachable: &'static str,
     pub bind_hint: &'static str,
     pub dismiss: &'static str,
+    pub unbound: &'static str,
 }
 
 pub fn texts(kind: LangKind) -> &'static Texts {
@@ -189,6 +190,7 @@ static EN: Texts = Texts {
     repo_unreachable: "{repo} does not exist, or {agent} cannot see it.",
     bind_hint: "Invite the agent account as a collaborator on GitHub, accept the invite, then bind again.",
     dismiss: "Dismiss",
+    unbound: "no repository bound",
 };
 
 static ZH: Texts = Texts {
@@ -244,6 +246,7 @@ static ZH: Texts = Texts {
     repo_unreachable: "仓库 {repo} 不存在，或 agent 账号 {agent} 看不到它。",
     bind_hint: "先在 GitHub 上把 agent 账号加为 collaborator 并接受邀请，然后重新绑定。",
     dismiss: "关闭",
+    unbound: "未绑定仓库",
 };
 
 #[cfg(test)]

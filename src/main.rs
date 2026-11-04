@@ -1057,13 +1057,23 @@ impl eframe::App for App {
                 .max_height(250.0)
                 .show(ui, |ui| {
                     for instance in self.instances.clone() {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                        let unbound = instance.repo == "not configured";
+                        let frame = if unbound {
+                            egui::Frame::group(ui.style())
+                                .stroke(egui::Stroke::new(1.0, palette.warn))
+                        } else {
+                            egui::Frame::group(ui.style())
+                        };
+                        frame.show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.strong(&instance.profile);
                                 if instance.running {
                                     ui.colored_label(palette.accent, t.running);
                                 } else {
                                     ui.colored_label(palette.weak, t.stopped);
+                                }
+                                if unbound {
+                                    ui.colored_label(palette.warn, t.unbound);
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -1137,30 +1147,33 @@ impl eframe::App for App {
                                     ui.add_enabled(false, egui::Button::new(t.configure))
                                         .on_hover_text(t.configure_hint);
                                 }
-                            });
-                            if instance.repo == "not configured" {
-                                if self.binding.as_deref() == Some(instance.profile.as_str()) {
-                                    ui.horizontal(|ui| {
-                                        ui.label(t.repo_label).on_hover_text(t.repo_tooltip);
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut self.bind_repo)
-                                                .hint_text(t.repo_hint)
-                                                .desired_width(260.0),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        if ui.button(t.bind_repo).clicked() {
-                                            bind_clicked =
-                                                Some((instance.profile.clone(), instance.port));
-                                        }
-                                        if ui.button(t.cancel).clicked() {
-                                            cancel_bind = true;
-                                        }
-                                    });
-                                } else if ui.button(t.bind_repo).clicked() {
+                                if unbound
+                                    && self.binding.as_deref() != Some(instance.profile.as_str())
+                                    && ui.button(t.bind_repo).clicked()
+                                {
                                     self.binding = Some(instance.profile.clone());
                                     self.bind_repo.clear();
                                 }
+                            });
+                            if unbound && self.binding.as_deref() == Some(instance.profile.as_str())
+                            {
+                                ui.horizontal(|ui| {
+                                    ui.label(t.repo_label).on_hover_text(t.repo_tooltip);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.bind_repo)
+                                            .hint_text(t.repo_hint)
+                                            .desired_width(260.0),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button(t.bind_repo).clicked() {
+                                        bind_clicked =
+                                            Some((instance.profile.clone(), instance.port));
+                                    }
+                                    if ui.button(t.cancel).clicked() {
+                                        cancel_bind = true;
+                                    }
+                                });
                             }
                             if self.editing.as_deref() == Some(instance.profile.as_str()) {
                                 ui.horizontal(|ui| {
