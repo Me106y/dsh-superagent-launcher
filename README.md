@@ -50,7 +50,16 @@ safely either way.
   directory, starts it, then binds the repository through the plugin's own
   `PUT /orchestrator/api/settings/source:github`. Going through the API is deliberate:
   it runs the plugin's setup check (repository readable, agent account can push) and
-  restarts it. Editing files directly would skip that check.
+  restarts it. Editing files directly would skip that check. The agent CLI
+  (`<cli> api user --jq .login`) is run first, so a broken wrapper fails before a profile
+  exists; if a later step fails, the profile this job created is removed again. A profile
+  left over from an earlier failed attempt (`not configured`) is reused instead of refused.
+
+A window opened from Finder inherits launchd's PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), which
+has neither Homebrew nor a per-user bin directory. Agent CLIs are usually shell wrappers that
+call `gh` by name, so every spawned profile gets `/opt/homebrew/bin`, `/usr/local/bin`,
+`~/…/sbin`, `~/.local/bin` and `~/.npm-global/bin` added to its PATH; without that the plugin's
+own setup check fails with `gh: not found`.
 
 ## Build and run
 
@@ -69,7 +78,7 @@ Headless modes, used by the smoke tests:
 
 ```sh
 dsh-superagent-launcher --list                       # tab-separated view of the same rows
-dsh-superagent-launcher --add owner/name [--allow login,...]
+dsh-superagent-launcher --add owner/name [--allow login,...] [--cli path]
 dsh-superagent-launcher --accounts <port> <logins> <cli>
 dsh-superagent-launcher --remove <profile> [--purge]
 ```

@@ -19,6 +19,9 @@
 //!   process is stopped and *waited for* before any file is touched, the state directory is kept unless asked
 //!   for, and it is only removed when it is a plain directory under the DSH state root — never a symlink, never
 //!   a path outside it.
+//! * A window opened from Finder inherits launchd's PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), which has neither
+//!   Homebrew nor a per-user bin directory. Agent CLIs are shell wrappers around `gh`, so every profile is
+//!   spawned with a PATH that can find them; without it the plugin's own setup check reports `gh: not found`.
 //!
 //! UI text is English on purpose: egui ships no CJK font, and bundling a system font is not something this
 //! tool should do (redistribution). Labels stay short and technical.
@@ -95,6 +98,35 @@ fn node_bin() -> PathBuf {
         }
     }
     PathBuf::from("node")
+}
+
+/// The PATH a spawned profile should see.
+///
+/// Launchd gives a Finder-launched window only `/usr/bin:/bin:/usr/sbin:/sbin`. The agent CLI is typically a
+/// shell wrapper that calls `gh` by name, so the profile needs the Homebrew and per-user bin directories even
+/// when this binary itself was started with a minimal environment.
+fn child_path() -> String {
+    let mut entries: Vec<String> = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut extra: Vec<PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/homebrew/sbin", "/usr/local/sbin"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        extra.push(Path::new(&home).join(".local/bin"));
+        extra.push(Path::new(&home).join(".npm-global/bin"));
+    }
+    for path in extra {
+        let path = path.display().to_string();
+        if !entries.iter().any(|entry| entry == &path) {
+            entries.push(path);
+        }
+    }
+    entries.join(":")
 }
 
 fn log_for(profile: &str) -> PathBuf {
@@ -283,6 +315,7 @@ fn start(profile: &str) -> Result<(), String> {
         .arg("--profile")
         .arg(profile)
         .arg("--no-open")
+        .env("PATH", child_path())
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
@@ -484,7 +517,9 @@ fn create_profile(template: &str, repo: &str, progress: &dyn Fn(&str)) -> Result
         return Err(format!("template profile {template} does not exist"));
     }
     if target.exists() {
-        return Err(format!("profile {name} already exists"));
+        return Err(format!(
+            "profile {name} already exists; delete it first, or add a different repository"
+        ));
     }
 
     progress("allocating a free port");
@@ -745,24 +780,68 @@ fn bind_policy(port: u16, login: &str) -> Result<(), String> {
     }
 }
 
-/// Ask the agent CLI which GitHub account it is signed in as, purely for the confirmation message.
-fn agent_login(cli: &str) -> Option<String> {
-    if cli.is_empty() {
-        return None;
+/// The agent CLI as a runnable path: a bare name is looked up in the PATH a profile would see.
+fn cli_program(cli: &str) -> PathBuf {
+    if cli.contains('/') {
+        return PathBuf::from(cli);
     }
-    let output = Command::new(cli)
+    for dir in child_path().split(':') {
+        let candidate = Path::new(dir).join(cli);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(cli)
+}
+
+/// Run the agent CLI the way the plugin's setup check will, and read the account it reports.
+///
+/// `Ok(None)` means no CLI was configured and the plugin falls back to its default. A failure here would
+/// otherwise surface much later, as a setup rejection after a profile had already been created, so it is
+/// checked before anything is written.
+fn preflight_cli(cli: &str) -> Result<Option<String>, String> {
+    if cli.is_empty() {
+        return Ok(None);
+    }
+    let output = Command::new(cli_program(cli))
         .args(["api", "user", "--jq", ".login"])
+        .env("PATH", child_path())
         .output()
-        .ok()?;
+        .map_err(|error| format!("cannot run the agent cli {cli}: {error}"))?;
     if !output.status.success() {
-        return None;
+        // The wrapper reports its own failure on stderr (`exec: gh: not found`), which is the useful part.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+        let detail = if detail.is_empty() {
+            match output.status.code() {
+                Some(code) => format!("it exited with status {code}"),
+                None => "it was stopped by a signal".into(),
+            }
+        } else {
+            detail
+        };
+        return Err(format!(
+            "the agent cli {cli} cannot read its GitHub account: {detail}"
+        ));
     }
     let login = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!login.is_empty()).then_some(login)
+    Ok((!login.is_empty()).then_some(login))
+}
+
+/// A profile left behind by an earlier failed add: it carries this repository's name but nothing is bound.
+fn unconfigured_profile(repo: &str) -> Option<Instance> {
+    let slug = slug_for(repo);
+    discover()
+        .into_iter()
+        .find(|instance| instance.profile == slug && instance.repo == "not configured")
 }
 
 /// The whole "add a repository" job, run off the UI thread.
 /// `Result` carries the text shown when it finishes.
+///
+/// A profile left by an earlier failed add is reused instead of refused: it has nothing bound, and making the
+/// operator delete it first would be busywork. A failure after *this* job created the profile removes it again:
+/// an "add" is all or nothing, and a half-configured profile would otherwise sit there blocking a retry.
 fn add_repository(
     template: String,
     repo: String,
@@ -773,38 +852,68 @@ fn add_repository(
     let progress = |step: &str| {
         let _ = tx.send(Msg::Step(step.to_string()));
     };
-    progress("creating a profile");
-    let (profile, port) = create_profile(&template, &repo, &progress)?;
 
-    progress("starting it");
-    start(&profile)?;
-    if !wait_ready(port, &profile, Duration::from_secs(60)) {
-        return Err(format!(
-            "{profile} did not become ready on {port}; see {}",
-            log_for(&profile).display()
-        ));
-    }
+    progress("checking the agent cli");
+    let agent = preflight_cli(&cli)?;
 
-    progress(&format!("allowing {human} to ask for work"));
-    bind_policy(port, &human)?;
-
-    progress("binding the repository");
-    bind_repository(port, &repo, &cli, &progress)?;
-
-    progress("configuring the per-ticket checkout");
-    bind_executor(port)?;
-
-    // The plugin restarts after a successful save; wait for the port to answer again before opening it.
-    progress("waiting for the restart");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline {
-        if is_listening(port) {
-            break;
+    let (profile, port, created) = match unconfigured_profile(&repo) {
+        Some(instance) => {
+            progress(&format!("reusing the unconfigured profile {}", instance.profile));
+            (instance.profile, instance.port, false)
         }
-        thread::sleep(Duration::from_millis(500));
+        None => {
+            progress("creating a profile");
+            let (profile, port) = create_profile(&template, &repo, &progress)?;
+            (profile, port, true)
+        }
+    };
+
+    let job = (|| -> Result<(), String> {
+        if !is_listening(port) {
+            progress("starting it");
+            start(&profile)?;
+        }
+        if !wait_ready(port, &profile, Duration::from_secs(60)) {
+            return Err(format!(
+                "{profile} did not become ready on {port}; see {}",
+                log_for(&profile).display()
+            ));
+        }
+
+        progress(&format!("allowing {human} to ask for work"));
+        bind_policy(port, &human)?;
+
+        progress("binding the repository");
+        bind_repository(port, &repo, &cli, &progress)?;
+
+        progress("configuring the per-ticket checkout");
+        bind_executor(port)?;
+
+        // The plugin restarts after a successful save; wait for the port to answer again before opening it.
+        progress("waiting for the restart");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if is_listening(port) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = job {
+        if created {
+            progress("removing the half-made profile");
+            return Err(match remove_instance(&profile, true, &progress) {
+                Ok(_) => format!("{error} — {profile} was removed again"),
+                Err(rollback) => format!("{error} — {profile} could not be removed: {rollback}"),
+            });
+        }
+        return Err(format!("{error} — {profile} kept; fix the problem and retry"));
     }
+
     open_panel(&profile, port);
-    let agent = agent_login(&cli).unwrap_or_else(|| "the configured account".into());
+    let agent = agent.unwrap_or_else(|| "the configured account".into());
     Ok(format!(
         "{repo} added as {profile} on :{port} — agent {agent}, requester {human}"
     ))
@@ -1351,7 +1460,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    // `--add owner/name` runs the same job without the window, for smoke tests.
+    // `--add owner/name [--allow login] [--cli path]` runs the same job without the window, for smoke tests.
     if let Some(index) = std::env::args().position(|argument| argument == "--add") {
         let repo = std::env::args().nth(index + 1).unwrap_or_default();
         let instances = discover();
@@ -1359,9 +1468,10 @@ fn main() -> eframe::Result<()> {
             .first()
             .map(|instance| instance.profile.clone())
             .unwrap_or_default();
-        let cli = instances
-            .first()
-            .map(|instance| instance.cli.clone())
+        let cli = std::env::args()
+            .position(|argument| argument == "--cli")
+            .and_then(|index| std::env::args().nth(index + 1))
+            .or_else(|| instances.first().map(|instance| instance.cli.clone()))
             .unwrap_or_default();
         let human = std::env::args()
             .position(|argument| argument == "--allow")
