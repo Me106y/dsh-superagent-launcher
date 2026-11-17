@@ -118,6 +118,58 @@ pub fn node_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("node"))
 }
 
+/// The PATH a spawned profile should see.
+///
+/// A desktop launch does not inherit the shell's PATH: macOS hands the app
+/// `/usr/bin:/bin:/usr/sbin:/sbin`, and a desktop entry on Linux is no better. The agent CLI is usually a
+/// shell wrapper around `gh`, which lives in Homebrew or `/usr/local/bin`, so every child that runs the CLI
+/// — the profile itself and the preflight checks — needs those directories on its PATH.
+pub fn child_path() -> String {
+    let mut entries: Vec<String> = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect();
+    let home = home();
+    let mut extra = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/sbin"),
+        PathBuf::from("/usr/local/sbin"),
+        home.join(".local/bin"),
+        home.join(".npm-global/bin"),
+    ];
+    for parent in [home.join("local"), home.join(".nvm/versions/node")] {
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                extra.push(entry.path().join("bin"));
+            }
+        }
+    }
+    for path in extra {
+        let path = path.display().to_string();
+        if !entries.iter().any(|entry| entry == &path) {
+            entries.push(path);
+        }
+    }
+    entries.join(":")
+}
+
+/// Resolve a configured CLI to a runnable path, so a bare `gh-agent` also works from a desktop launch.
+pub fn resolve_program(program: &str) -> PathBuf {
+    if program.contains('/') {
+        return PathBuf::from(program);
+    }
+    for dir in child_path().split(':') {
+        let candidate = Path::new(dir).join(program);
+        if executable(&candidate) {
+            return candidate;
+        }
+    }
+    PathBuf::from(program)
+}
+
 /// Open a URL in the user's browser.
 pub fn open_url(url: &str) {
     #[cfg(target_os = "macos")]

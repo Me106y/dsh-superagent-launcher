@@ -11,3 +11,5 @@ serde_json = "1.0.154"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 # Only used by `--screenshot`, which captures the window for the README.
 png = "0.18"
+# The desktop locale, so `Lang::System` follows a Chinese macOS/Linux without `LANG` being set.
+sys-locale = "0.3.2"

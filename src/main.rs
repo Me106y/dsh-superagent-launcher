@@ -1,8 +1,8 @@
 //! DSH Superagent launcher.
 //!
 //! Finds every DSH profile that mounts `dsh-superagent`, shows the repository it is bound to and the port it
-//! serves, and lets you start / open / stop one of them, or add a new repository on a fresh profile and port.
-//! No auto-start: nothing here runs at login.
+//! serves, and lets you start / open / stop / delete one of them, or add a new repository on a fresh profile
+//! and port. No auto-start: nothing here runs at login.
 //!
 //! Facts that drive the design:
 //!
@@ -16,9 +16,16 @@
 //! * Binding a repository is a plugin operation, not a file edit: `PUT /orchestrator/api/settings/source:github`
 //!   runs the plugin's own setup check (repository readable, agent account can push) and restarts it. Adding a
 //!   repository any other way would skip that check.
+//! * Deleting a profile is the opposite: the plugin has no delete endpoint, so it is a filesystem operation. The
+//!   process is stopped and *waited for* before any file is touched, the state directory is kept unless asked
+//!   for, and it is only removed when it is a plain directory under the DSH state root — never a symlink, never
+//!   a path outside it.
+//! * A desktop launch does not inherit the shell's PATH. The agent CLI is a wrapper around `gh`, so profiles
+//!   are spawned with a PATH that can find it ([`platform::child_path`]); without it the plugin's setup check
+//!   fails with `gh: not found`.
 //!
-//! UI text is English on purpose: egui ships no CJK font, and bundling a system font is not something this
-//! tool should do (redistribution). Labels stay short and technical.
+//! The interface is bilingual and its palette follows the desktop's colour scheme: [`i18n`] holds the strings,
+//! [`theme`] the palettes, and [`fonts`] borrows a CJK font from the system so Chinese is not empty boxes.
 
 use eframe::egui;
 use i18n::{LangKind, fill};
@@ -62,6 +69,12 @@ struct Message {
 enum Msg {
     Step(String),
     Done(Result<String, String>),
+}
+
+/// A delete that has been requested and is waiting for confirmation inside the instance card.
+struct Deletion {
+    profile: String,
+    purge_state: bool,
 }
 
 fn home() -> PathBuf {
@@ -253,6 +266,7 @@ fn start(profile: &str) -> Result<(), String> {
         .arg("--profile")
         .arg(profile)
         .arg("--no-open")
+        .env("PATH", platform::child_path())
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
@@ -294,30 +308,91 @@ fn open_panel(profile: &str, port: u16) {
     platform::open_url(&url);
 }
 
-/// SIGTERM, never SIGKILL: the plugin releases its state-directory lock on a clean exit.
+/// Whether a command line is a DSH process at all, judged by its executable and the entry point it runs.
 ///
-/// The port is only a hint. Before signalling, the process command line must actually name this profile,
-/// so a port reused by something else is never killed by mistake.
-fn stop(port: u16, profile: &str) {
-    let Ok(output) = Command::new("lsof")
-        .args(["-ti", &format!("tcp:{port}")])
-        .output()
-    else {
-        return;
+/// A command line that merely *mentions* `--profile <name>` is not this instance: a `bash -c` script, an
+/// editor, or a log tail can contain that text, and signalling those would be a bug. Only a `dsh`
+/// executable, or a `node` running a `dsh` entry point, counts.
+fn is_dsh_command(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    let Some(executable) = tokens.next() else {
+        return false;
     };
-    let marker = format!("--profile {profile}");
-    for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-        let Ok(command) = Command::new("ps")
-            .args(["-p", pid, "-o", "command="])
-            .output()
-        else {
+    let name = executable.rsplit('/').next().unwrap_or(executable);
+    if name == "dsh" {
+        return true;
+    }
+    name == "node"
+        && tokens.any(|token| {
+            token.ends_with("/dsh")
+                || token.ends_with("/dsh/lib/bin.js")
+                || token.contains("/@deepseek-ai/dsh/")
+        })
+}
+
+/// Pids whose command line names this profile as `--profile <name>`.
+///
+/// Matching the command line rather than the listening port is what keeps a port reused by an unrelated
+/// process out of reach.
+fn profile_pids(profile: &str) -> Vec<String> {
+    let Ok(output) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
+        return Vec::new();
+    };
+    let flag = format!("--profile={profile}");
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.trim_start().splitn(2, char::is_whitespace);
+        let (Some(pid), Some(command)) = (parts.next(), parts.next()) else {
             continue;
         };
-        let command = String::from_utf8_lossy(&command.stdout);
-        if !command.contains(&marker) {
+        if !is_dsh_command(command) {
             continue;
         }
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        let names_profile = tokens.iter().any(|token| *token == flag)
+            || tokens
+                .windows(2)
+                .any(|pair| pair[0] == "--profile" && pair[1] == profile);
+        if names_profile {
+            pids.push(pid.to_string());
+        }
+    }
+    pids
+}
+
+/// SIGTERM, never SIGKILL: the plugin releases its state-directory lock on a clean exit.
+///
+/// The process is found by its command line, not by the port alone, so a port reused by something else is
+/// never signalled by mistake. Returns without waiting for the exit; callers about to touch files use
+/// [`wait_stopped`].
+fn stop(profile: &str, port: u16, t: &i18n::Texts) -> Result<(), String> {
+    let pids = profile_pids(profile);
+    if pids.is_empty() {
+        return if is_listening(port) {
+            Err(fill(
+                t.stop_foreign,
+                &[("port", &port.to_string()), ("profile", profile)],
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    for pid in &pids {
         let _ = Command::new("kill").args(["-TERM", pid]).status();
+    }
+    Ok(())
+}
+
+fn wait_stopped(profile: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if profile_pids(profile).is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -529,6 +604,118 @@ fn create_profile(
     Ok((name, port))
 }
 
+/// Remove a path without ever following a symlink: a profile that links a checkout into its `node_modules`
+/// must lose the link, not the checkout.
+fn remove_tree(path: &Path, t: &i18n::Texts) -> Result<(), String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(fill(
+                t.inspect_failed,
+                &[
+                    ("path", &path.display().to_string()),
+                    ("error", &error.to_string()),
+                ],
+            ));
+        }
+    };
+    let result = if meta.file_type().is_symlink() || !meta.is_dir() {
+        fs::remove_file(path)
+    } else {
+        fs::remove_dir_all(path)
+    };
+    result.map_err(|error| {
+        fill(
+            t.remove_failed,
+            &[
+                ("path", &path.display().to_string()),
+                ("error", &error.to_string()),
+            ],
+        )
+    })
+}
+
+/// True when `child` is a real descendant of `parent`, after resolving symlinks on both sides.
+fn is_under(child: &Path, parent: &Path) -> bool {
+    let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let (child, parent) = (resolve(child), resolve(parent));
+    child != parent && child.starts_with(&parent)
+}
+
+fn valid_profile_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+}
+
+/// Delete one configured instance: stop it, remove the profile and its log, and its state when asked.
+///
+/// The order matters. The process has to be gone before the profile directory is touched, otherwise the
+/// plugin keeps writing into a profile that no longer exists. The state directory is the only part that
+/// cannot be rebuilt, so it survives unless `purge_state` is set, and even then only when it is a plain
+/// directory under the DSH state root — a state dir pointed somewhere else is reported, never removed.
+fn remove_instance(
+    profile: &str,
+    purge_state: bool,
+    lang: LangKind,
+    progress: &dyn Fn(&str),
+) -> Result<String, String> {
+    let t = i18n::texts(lang);
+    if !valid_profile_name(profile) {
+        return Err(fill(t.not_a_profile_name, &[("profile", profile)]));
+    }
+    let Some(instance) = discover()
+        .into_iter()
+        .find(|instance| instance.profile == profile)
+    else {
+        return Err(fill(t.no_such_profile, &[("profile", profile)]));
+    };
+    let dir = profiles_dir().join(profile);
+    let manifest = fs::read_to_string(dir.join("package.json")).unwrap_or_default();
+    if !manifest.contains("dsh-superagent") {
+        return Err(fill(
+            t.not_superagent,
+            &[("dir", &dir.display().to_string())],
+        ));
+    }
+
+    progress(t.step_stop);
+    stop(profile, instance.port, t)?;
+    if !wait_stopped(profile, Duration::from_secs(15)) {
+        return Err(fill(t.still_running, &[("profile", profile)]));
+    }
+
+    progress(t.step_remove);
+    remove_tree(&dir, t)?;
+
+    let mut state = fill(
+        t.state_kept,
+        &[("dir", &instance.state_dir.display().to_string())],
+    );
+    if instance.state_dir.starts_with(&dir) {
+        state = t.state_with_profile.to_string();
+    } else if purge_state {
+        let is_symlink = fs::symlink_metadata(&instance.state_dir)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink || !is_under(&instance.state_dir, &dsh_home().join("state")) {
+            state = fill(
+                t.state_outside,
+                &[("dir", &instance.state_dir.display().to_string())],
+            );
+        } else {
+            progress(t.step_purge);
+            remove_tree(&instance.state_dir, t)?;
+            state = t.state_removed.to_string();
+        }
+    }
+
+    let log = log_for(profile);
+    if log.exists() {
+        let _ = fs::remove_file(&log);
+    }
+    Ok(fill(t.deleted, &[("profile", profile), ("state", &state)]))
+}
+
 /// Bind the repository through the plugin's own settings API, which runs the setup check and restarts it.
 fn bind_repository(
     port: u16,
@@ -659,8 +846,9 @@ fn agent_login(cli: &str) -> Option<String> {
     if cli.is_empty() {
         return None;
     }
-    let output = Command::new(cli)
+    let output = Command::new(platform::resolve_program(cli))
         .args(["api", "user", "--jq", ".login"])
+        .env("PATH", platform::child_path())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -677,20 +865,26 @@ fn agent_login(cli: &str) -> Option<String> {
 /// still fix the input.
 fn preflight_repository(repo: &str, cli: &str, t: &i18n::Texts) -> Result<(), String> {
     let agent = agent_login(cli).unwrap_or_else(|| cli.to_string());
-    let output = Command::new(cli)
+    let output = Command::new(platform::resolve_program(cli))
         .args([
             "api",
             &format!("repos/{repo}"),
             "--jq",
             "if .permissions.push then \"push\" else \"no-push\" end",
         ])
+        .env("PATH", platform::child_path())
         .output()
         .map_err(|error| error.to_string())?;
     if !output.status.success() {
-        return Err(fill(
-            t.repo_unreachable,
-            &[("repo", repo), ("agent", &agent)],
-        ));
+        let text = fill(t.repo_unreachable, &[("repo", repo), ("agent", &agent)]);
+        // `gh: Not Found (HTTP 404)`, or a wrapper's own error when its `gh` cannot be found.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(
+            match stderr.lines().map(str::trim).find(|line| !line.is_empty()) {
+                Some(detail) => format!("{text}\n{detail}"),
+                None => text,
+            },
+        );
     }
     let verdict = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if verdict != "push" {
@@ -808,6 +1002,7 @@ struct App {
     edit_allowed: String,
     binding: Option<String>,
     bind_repo: String,
+    deleting: Option<Deletion>,
     theme: theme::ThemeChoice,
     lang: i18n::Lang,
     cjk: bool,
@@ -848,6 +1043,7 @@ impl App {
             edit_allowed: String::new(),
             binding: None,
             bind_repo: String::new(),
+            deleting: None,
             theme: saved.theme,
             lang: saved.lang,
             cjk: fonts::available(),
@@ -913,6 +1109,32 @@ impl App {
                 self.job_status.clear();
                 self.instances = discover();
                 self.last_scan = Instant::now();
+                // A deleted profile may still be the one being edited, bound or waited on; drop that state.
+                let profiles: Vec<String> = self
+                    .instances
+                    .iter()
+                    .map(|instance| instance.profile.clone())
+                    .collect();
+                if self.editing.as_ref().is_some_and(|p| !profiles.contains(p)) {
+                    self.editing = None;
+                }
+                if self.binding.as_ref().is_some_and(|p| !profiles.contains(p)) {
+                    self.binding = None;
+                }
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|(p, _, _)| !profiles.contains(p))
+                {
+                    self.pending = None;
+                }
+                if self
+                    .deleting
+                    .as_ref()
+                    .is_some_and(|deletion| !profiles.contains(&deletion.profile))
+                {
+                    self.deleting = None;
+                }
                 match result {
                     Ok(text) => self.notify(text),
                     Err(text) => self.notify_error(text),
@@ -1000,6 +1222,8 @@ impl eframe::App for App {
         let mut bind_clicked: Option<(String, u16)> = None;
         let mut cancel_bind = false;
         let mut dismiss_message = false;
+        let mut request_delete: Option<String> = None;
+        let busy = self.job.is_some();
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(4.0);
@@ -1154,6 +1378,17 @@ impl eframe::App for App {
                                     self.binding = Some(instance.profile.clone());
                                     self.bind_repo.clear();
                                 }
+                                if ui
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new(
+                                            egui::RichText::new(t.delete).color(palette.error),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    request_delete = Some(instance.profile.clone());
+                                }
                             });
                             if unbound && self.binding.as_deref() == Some(instance.profile.as_str())
                             {
@@ -1236,7 +1471,6 @@ impl eframe::App for App {
                 }
             });
             ui.horizontal(|ui| {
-                let busy = self.job.is_some();
                 if ui
                     .add_enabled(
                         !busy && !self.agent_cli.is_empty(),
@@ -1329,6 +1563,99 @@ impl eframe::App for App {
             self.message = None;
         }
 
+        if let Some(profile) = request_delete {
+            self.deleting = Some(Deletion {
+                profile,
+                purge_state: false,
+            });
+        }
+
+        // The confirmation floats above the list: inside a card it would be clipped by the scroll area.
+        if let Some((profile, purge_state)) = self
+            .deleting
+            .as_ref()
+            .map(|deletion| (deletion.profile.clone(), deletion.purge_state))
+        {
+            let instance = self
+                .instances
+                .iter()
+                .find(|instance| instance.profile == profile)
+                .cloned();
+            let mut purge = purge_state;
+            let (mut confirm, mut cancel) = (false, false);
+            egui::Window::new(fill(t.delete_title, &[("profile", &profile)]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(fill(
+                            t.delete_scope,
+                            &[("dir", &profiles_dir().join(&profile).display().to_string())],
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                    if instance.as_ref().is_some_and(|instance| instance.running) {
+                        ui.label(egui::RichText::new(t.delete_running).weak().small());
+                    }
+                    ui.add_space(2.0);
+                    ui.checkbox(&mut purge, t.delete_state_toggle);
+                    if let Some(instance) = &instance {
+                        ui.label(
+                            egui::RichText::new(fill(
+                                t.delete_state_hint,
+                                &[("dir", &instance.state_dir.display().to_string())],
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!busy, egui::Button::new(t.cancel)).clicked() {
+                            cancel = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(
+                                    egui::RichText::new(t.delete).color(palette.error),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            confirm = true;
+                        }
+                    });
+                });
+
+            if let Some(deletion) = self.deleting.as_mut() {
+                deletion.purge_state = purge;
+            }
+            if cancel {
+                self.deleting = None;
+            } else if confirm {
+                if let Some(deletion) = self.deleting.take() {
+                    let (sender, receiver) = mpsc::channel();
+                    self.job = Some(receiver);
+                    self.job_status = t.working.into();
+                    let tx = sender.clone();
+                    thread::spawn(move || {
+                        let result = remove_instance(
+                            &deletion.profile,
+                            deletion.purge_state,
+                            lang,
+                            &|step| {
+                                let _ = tx.send(Msg::Step(step.to_string()));
+                            },
+                        );
+                        let _ = tx.send(Msg::Done(result));
+                    });
+                }
+            }
+        }
+
         if let Some((profile, port)) = bind_clicked {
             let repo = self.bind_repo.trim().to_string();
             if !valid_repo(&repo) {
@@ -1393,10 +1720,10 @@ impl eframe::App for App {
                 }
                 Err(error) => self.notify(error),
             },
-            Some(("stop", profile, port)) => {
-                stop(port, &profile);
-                self.notify(fill(t.stopping, &[("profile", &profile)]));
-            }
+            Some(("stop", profile, port)) => match stop(&profile, port, t) {
+                Ok(()) => self.notify(fill(t.stopping, &[("profile", &profile)])),
+                Err(error) => self.notify_error(error),
+            },
             _ => {}
         }
     }
@@ -1488,6 +1815,20 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // `--remove <profile> [--purge]` deletes one profile, headlessly.
+    if let Some(index) = std::env::args().position(|argument| argument == "--remove") {
+        let profile = std::env::args().nth(index + 1).unwrap_or_default();
+        let purge = std::env::args().any(|argument| argument == "--purge");
+        match remove_instance(&profile, purge, LangKind::En, &|_| {}) {
+            Ok(text) => println!("{text}"),
+            Err(text) => {
+                eprintln!("{text}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     // `--add owner/name [--allow a,b]` runs the same job without the window, for smoke tests.
     if let Some(index) = std::env::args().position(|argument| argument == "--add") {
         let repo = std::env::args().nth(index + 1).unwrap_or_default();
@@ -1496,7 +1837,10 @@ fn main() -> eframe::Result<()> {
             .first()
             .map(|instance| instance.profile.clone())
             .unwrap_or_default();
-        let cli = detect_agent_cli(&instances);
+        let cli = std::env::args()
+            .position(|argument| argument == "--cli")
+            .and_then(|index| std::env::args().nth(index + 1))
+            .unwrap_or_else(|| detect_agent_cli(&instances));
         let who = std::env::args()
             .position(|argument| argument == "--allow")
             .and_then(|index| std::env::args().nth(index + 1))
@@ -1545,4 +1889,28 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::new(launch)))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_dsh_command_lines_are_matched() {
+        assert!(is_dsh_command(
+            "node /x/@deepseek-ai/dsh/lib/bin.js --profile a"
+        ));
+        assert!(is_dsh_command("/usr/local/bin/dsh --profile a"));
+        // A shell wrapper that only *mentions* the flag must never be signalled.
+        assert!(!is_dsh_command("/bin/bash -c dsh --profile a"));
+        assert!(!is_dsh_command("node /tmp/other.js --profile a"));
+    }
+
+    #[test]
+    fn profile_names_stay_inside_the_profiles_directory() {
+        assert!(valid_profile_name("superagent-me106y-dsh-job-ledger"));
+        assert!(!valid_profile_name(""));
+        assert!(!valid_profile_name(".."));
+        assert!(!valid_profile_name("a/b"));
+    }
 }

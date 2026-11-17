@@ -1,7 +1,7 @@
 # DSH Superagent 启动器
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai) 上的 **dsh-superagent** 插件配的一个小窗口：
-列出所有挂载了该插件的 DSH profile，一键**启动 / 打开面板 / 停止**，也能直接新建
+列出所有挂载了该插件的 DSH profile，一键**启动 / 打开面板 / 停止 / 删除**，也能直接新建
 「仓库 → profile」的绑定。Rust + [egui](https://github.com/emilk/egui)，Linux 与 macOS。
 
 ![中文浅色界面](docs/zh-light.png)
@@ -31,8 +31,12 @@ dsh-superagent 的每个实例都跑在**独立的 DSH profile** 里：占一个
 - **列出实例**：扫描 `$DSH_HOME/profiles/*/package.json`，只显示挂载了
   `dsh-superagent` 的 profile。
 - **启动 / 停止**：启动时拉起 `node <runtime>/…/bin.js --profile <p> --no-open`，日志落在
-  用户日志目录，token 从日志里读；停止用 `SIGTERM`，先核对端口对应进程确实属于这个
-  profile，绝不错杀。
+  用户日志目录，token 从日志里读；停止用 `SIGTERM`，按命令行（`--profile <p>`）找进程并
+  确认它确实是 DSH 进程，绝不错杀。
+- **删除**：卡片上的「删除」→ 就地确认。先停掉实例并**等进程真正退出**，再删 profile
+  目录和日志。状态目录（工单库、每单 checkout）默认保留，勾选「同时删除状态目录」才删，
+  而且只删 `<dsh home>/state` 下的普通目录——符号链接和指到别处的 stateDir 一律保留并
+  报出路径。进程 15 秒内没退出就一个文件都不动。
 - **打开面板**：自动带上日志里最新一次登录 token，`xdg-open` / `open` 打开
   `http://127.0.0.1:<port>/?token=…`。
 - **配置「谁可以派活」**：直接调插件的管理 API 写 policy，支持多个 GitHub 登录名
@@ -43,6 +47,10 @@ dsh-superagent 的每个实例都跑在**独立的 DSH profile** 里：占一个
   账号可 push）真的跑一遍。
 - **Agent CLI 自动探测**：不需要用户填。依次尝试 `DSH_SUPERAGENT_AGENT_CLI` →
   已有 profile 的配置 → `~/.local/bin/gh-agent` → `~/.local/bin/gh-*`。
+- **从桌面启动也能跑**：桌面启动不继承 shell 的 `PATH`（macOS 给的是
+  `/usr/bin:/bin:/usr/sbin:/sbin`），而 agent CLI 是调用 `gh` 的包装脚本。启动器给拉起的
+  profile 补上 Homebrew、`/usr/local/bin`、`~/.local/bin` 等目录，否则插件的部署检查会报
+  `gh: not found`。
 - **主题与语言**：浅色 / 深色 / 跟随系统；中文 / English（跟随系统语言）。
 
 ## 它从哪里读信息
@@ -69,7 +77,7 @@ SQLite 是**链接**进二进制的（`rusqlite`，bundled），不依赖系统�
   - Linux：全局 `@deepseek-ai/dsh` 包所在的 Node 安装（`~/local/node-*/lib/node_modules`、
     `~/.nvm/versions/node/*/lib/node_modules`、`/usr/local/lib/node_modules`、
     `/usr/lib/node_modules`），也可以用 `DSH_INSTALL_DIR` 指定
-- `node`、`curl`、`lsof`
+- `node`、`curl`
 - 中文界面需要系统中有 CJK 字体（通过 `fc-match` 找，或用 `DSH_SUPERAGENT_FONT=path[:index]`
   指定；找不到时界面自动保持英文）
 
@@ -104,16 +112,19 @@ gsettings set org.gnome.shell favorite-apps \
 ```sh
 cargo build --release
 ./target/release/dsh-superagent-launcher
+./scripts/install-app.sh        # 更新 ~/Applications/DSH Superagent.app
 ```
 
-日志写到 `~/Library/Logs`，用 `open` 打开面板。桌面打包（`.app`）尚未提供。
+日志写到 `~/Library/Logs`，用 `open` 打开面板。`.app` 里带的是**自己的一份**二进制，
+`cargo build` 不会更新它；`scripts/install-app.sh` 会重新构建、替换并用 ad-hoc 签名重签
+bundle（替换可执行文件会让原签名失效，不重签 macOS 拒绝启动）。
 
 ## 用法
 
 ### 主界面
 
 每个 profile 一张卡片：名称、运行状态、端口、仓库、agent CLI、可派活的人、状态目录，
-下面是 `打开面板 / 启动 / 停止 / 配置`。右上角切换主题和语言。
+下面是 `打开面板 / 启动 / 停止 / 配置 / 删除`。右上角切换主题和语言。
 
 ### 添加仓库
 
@@ -137,8 +148,9 @@ Agent CLI 不用填——它由部署阶段自动确定并显示在表单下方�
 ```sh
 dsh-superagent-launcher --list                     # 同界面内容的制表符视图
 dsh-superagent-launcher --diagnose                 # 解析后的主题/语言、字体、agent CLI
-dsh-superagent-launcher --add owner/name [--allow login,login]
+dsh-superagent-launcher --add owner/name [--allow login,login] [--cli path]
 dsh-superagent-launcher --accounts <port> <login,login>
+dsh-superagent-launcher --remove <profile> [--purge]
 dsh-superagent-launcher --screenshot out.png [--theme light|dark|system] [--lang zh|en]
 ```
 
@@ -164,13 +176,14 @@ cargo fmt
 
 | 文件 | 负责 |
 | --- | --- |
-| `src/main.rs` | 发现实例、启动/停止、设置 API、界面 |
-| `src/platform.rs` | DSH 安装位置、日志目录、SQLite 读取、打开 URL |
+| `src/main.rs` | 发现实例、启动/停止/删除、设置 API、界面 |
+| `src/platform.rs` | DSH 安装位置、日志目录、子进程 PATH、SQLite 读取、打开 URL |
 | `src/theme.rs` | 浅色/深色两套配色与 egui 样式 |
 | `src/i18n.rs` | 中英文案与模板替换 |
 | `src/settings.rs` | 主题 / 语言的持久化 |
 | `src/fonts.rs` | 从系统借一个 CJK 字体 |
-| `packaging/` | 图标、桌面入口、安装脚本 |
+| `packaging/` | 图标、桌面入口、Linux 安装脚本 |
+| `scripts/install-app.sh` | 更新 macOS `.app` 里的二进制并重签 |
 
 ## 许可证
 
@@ -179,7 +192,8 @@ cargo fmt
 ## English
 
 A small desktop launcher for the **dsh-superagent** plugin on DeepSeek Harness: it lists
-every profile that mounts the plugin, starts / opens / stops it, and binds a new repository
-on a fresh profile and port. Rust + egui, Linux and macOS, light and dark themes, English
-and Chinese UI. See the screenshots above and the sections on installation and the command
-line; `./packaging/install.sh` installs it into the application menu on Linux.
+every profile that mounts the plugin, starts / opens / stops / deletes it, and binds a new
+repository on a fresh profile and port. Rust + egui, Linux and macOS, light and dark themes,
+English and Chinese UI. See the screenshots above and the sections on installation and the
+command line; `./packaging/install.sh` installs it into the application menu on Linux, and
+`./scripts/install-app.sh` refreshes the macOS `.app` bundle.

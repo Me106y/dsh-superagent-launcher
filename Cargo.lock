@@ -772,6 +772,7 @@ dependencies = [
  "png",
  "rusqlite",
  "serde_json",
+ "sys-locale",
 ]
 
 [[package]]

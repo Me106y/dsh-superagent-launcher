@@ -7,9 +7,11 @@
 use eframe::egui;
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     sync::Arc,
 };
+
+#[cfg(not(target_os = "macos"))]
+use std::process::Command;
 
 /// Add the CJK font as a fallback of both families. Returns false when no such font is installed.
 pub fn install(ctx: &egui::Context) -> bool {
@@ -119,11 +121,13 @@ mod tests {
         assert!(install(&ctx));
         // Fonts are only built inside a frame.
         let mut covered = false;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ctx| {
             covered = ctx.fonts_mut(|fonts| {
                 fonts.has_glyphs(&egui::FontId::proportional(14.0), "中文仓库仓库")
             });
         });
+        // The first frame allocates the font atlas; its delta has to be consumed before the context drops.
+        output.textures_delta.clear();
         assert!(covered, "the chosen font has no Chinese glyphs");
     }
 }

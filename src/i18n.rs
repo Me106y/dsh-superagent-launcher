@@ -61,6 +61,10 @@ pub fn fill(template: &str, args: &[(&str, &str)]) -> String {
     out
 }
 
+/// Whether the desktop is Chinese.
+///
+/// A window opened from Finder or a desktop entry has no `LANG`, so the environment is only a hint for a
+/// terminal launch; the desktop locale is what decides by default.
 fn system_locale_is_chinese() -> bool {
     for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
         let Ok(value) = std::env::var(key) else {
@@ -71,7 +75,7 @@ fn system_locale_is_chinese() -> bool {
         }
         return value.to_ascii_lowercase().starts_with("zh");
     }
-    false
+    sys_locale::get_locale().is_some_and(|locale| locale.to_ascii_lowercase().starts_with("zh"))
 }
 
 pub struct Texts {
@@ -128,6 +132,28 @@ pub struct Texts {
     pub bind_hint: &'static str,
     pub dismiss: &'static str,
     pub unbound: &'static str,
+    // Deleting a profile.
+    pub delete: &'static str,
+    pub delete_title: &'static str,
+    pub delete_scope: &'static str,
+    pub delete_running: &'static str,
+    pub delete_state_toggle: &'static str,
+    pub delete_state_hint: &'static str,
+    pub deleted: &'static str,
+    pub state_kept: &'static str,
+    pub state_removed: &'static str,
+    pub state_with_profile: &'static str,
+    pub state_outside: &'static str,
+    pub still_running: &'static str,
+    pub no_such_profile: &'static str,
+    pub not_a_profile_name: &'static str,
+    pub not_superagent: &'static str,
+    pub inspect_failed: &'static str,
+    pub remove_failed: &'static str,
+    pub step_stop: &'static str,
+    pub step_remove: &'static str,
+    pub step_purge: &'static str,
+    pub stop_foreign: &'static str,
 }
 
 pub fn texts(kind: LangKind) -> &'static Texts {
@@ -191,6 +217,27 @@ static EN: Texts = Texts {
     bind_hint: "Invite the agent account as a collaborator on GitHub, accept the invite, then bind again.",
     dismiss: "Dismiss",
     unbound: "no repository bound",
+    delete: "Delete",
+    delete_title: "Delete {profile}?",
+    delete_scope: "Removes {dir} and its log. Not reversible.",
+    delete_running: "It is running, so it is stopped first (SIGTERM).",
+    delete_state_toggle: "also delete the state directory",
+    delete_state_hint: "{dir} — tickets and per-ticket checkouts",
+    deleted: "{profile} deleted — {state}",
+    state_kept: "state kept at {dir}",
+    state_removed: "state removed",
+    state_with_profile: "state removed with the profile",
+    state_outside: "state left at {dir} (not a plain directory under the DSH state root)",
+    still_running: "{profile} is still running; nothing was deleted",
+    no_such_profile: "no profile named {profile} mounts dsh-superagent",
+    not_a_profile_name: "not a profile name: {profile}",
+    not_superagent: "{dir} does not look like a dsh-superagent profile",
+    inspect_failed: "cannot inspect {path}: {error}",
+    remove_failed: "cannot remove {path}: {error}",
+    step_stop: "stopping it (SIGTERM)",
+    step_remove: "removing the profile",
+    step_purge: "removing the state directory",
+    stop_foreign: "port {port} is in use but no process names --profile {profile}; stop it by hand and retry",
 };
 
 static ZH: Texts = Texts {
@@ -247,6 +294,27 @@ static ZH: Texts = Texts {
     bind_hint: "先在 GitHub 上把 agent 账号加为 collaborator 并接受邀请，然后重新绑定。",
     dismiss: "关闭",
     unbound: "未绑定仓库",
+    delete: "删除",
+    delete_title: "删除 {profile}？",
+    delete_scope: "将删除 {dir} 及其日志，不可恢复。",
+    delete_running: "正在运行，会先停止（SIGTERM）。",
+    delete_state_toggle: "同时删除状态目录",
+    delete_state_hint: "{dir} —— 工单和每个工单的 checkout",
+    deleted: "已删除 {profile} —— {state}",
+    state_kept: "状态目录保留在 {dir}",
+    state_removed: "状态目录已删除",
+    state_with_profile: "状态目录随 profile 一起删除",
+    state_outside: "状态目录留在 {dir}（不是 DSH 状态根下的普通目录）",
+    still_running: "{profile} 还在运行，没有删除任何东西",
+    no_such_profile: "没有名为 {profile} 且挂载 dsh-superagent 的 profile",
+    not_a_profile_name: "不是合法的 profile 名：{profile}",
+    not_superagent: "{dir} 不像是 dsh-superagent 的 profile",
+    inspect_failed: "无法检查 {path}：{error}",
+    remove_failed: "无法删除 {path}：{error}",
+    step_stop: "停止（SIGTERM）",
+    step_remove: "删除 profile",
+    step_purge: "删除状态目录",
+    stop_foreign: "端口 {port} 被占用，但没有进程使用 --profile {profile}；请手动停止后重试",
 };
 
 #[cfg(test)]
