@@ -1,8 +1,8 @@
 //! DSH Superagent launcher.
 //!
 //! Finds every DSH profile that mounts `dsh-superagent`, shows the repository it is bound to and the port it
-//! serves, and lets you start / open / stop one of them, or add a new repository on a fresh profile and port.
-//! No auto-start: nothing here runs at login.
+//! serves, and lets you start / open / stop one of them, add a new repository on a fresh profile and port, or
+//! delete a profile that is no longer wanted. No auto-start: nothing here runs at login.
 //!
 //! Facts that drive the design:
 //!
@@ -15,6 +15,10 @@
 //! * Binding a repository is a plugin operation, not a file edit: `PUT /orchestrator/api/settings/source:github`
 //!   runs the plugin's own setup check (repository readable, agent account can push) and restarts it. Adding a
 //!   repository any other way would skip that check.
+//! * Deleting a profile is the opposite: the plugin has no delete endpoint, so it is a filesystem operation. The
+//!   process is stopped and *waited for* before any file is touched, the state directory is kept unless asked
+//!   for, and it is only removed when it is a plain directory under the DSH state root — never a symlink, never
+//!   a path outside it.
 //!
 //! UI text is English on purpose: egui ships no CJK font, and bundling a system font is not something this
 //! tool should do (redistribution). Labels stay short and technical.
@@ -30,6 +34,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+/// Destructive actions share one colour in the UI.
+const DANGER: egui::Color32 = egui::Color32::from_rgb(220, 90, 80);
 
 /// A profile that mounts dsh-superagent.
 #[derive(Clone)]
@@ -47,6 +54,12 @@ struct Instance {
 enum Msg {
     Step(String),
     Done(Result<String, String>),
+}
+
+/// A delete that has been requested and is waiting for confirmation inside the instance card.
+struct Deletion {
+    profile: String,
+    purge_state: bool,
 }
 
 fn home() -> PathBuf {
@@ -311,30 +324,90 @@ fn open_panel(profile: &str, port: u16) {
     let _ = Command::new("/usr/bin/open").arg(url).spawn();
 }
 
+/// Whether a command line is a DSH process at all, judged by its executable and the entry point it runs.
+///
+/// A command line that merely *mentions* `--profile <name>` is not this instance: a `bash -c` script, an
+/// editor, or a log tail can contain that text, and signalling those would be a bug. Only a `dsh`
+/// executable, or a `node` running a `dsh` entry point, counts.
+fn is_dsh_command(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    let Some(executable) = tokens.next() else {
+        return false;
+    };
+    let name = executable.rsplit('/').next().unwrap_or(executable);
+    if name == "dsh" {
+        return true;
+    }
+    name == "node"
+        && tokens.any(|token| {
+            token.ends_with("/dsh")
+                || token.ends_with("/dsh/lib/bin.js")
+                || token.contains("/@deepseek-ai/dsh/")
+        })
+}
+
+/// Pids whose command line names this profile as `--profile <name>`.
+///
+/// Matching the command line rather than the listening port is what keeps a port reused by an unrelated
+/// process out of reach.
+fn profile_pids(profile: &str) -> Vec<String> {
+    let Ok(output) = Command::new("/bin/ps").args(["-axo", "pid=,command="]).output() else {
+        return Vec::new();
+    };
+    let flag = format!("--profile={profile}");
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.trim_start().splitn(2, char::is_whitespace);
+        let (Some(pid), Some(command)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !is_dsh_command(command) {
+            continue;
+        }
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        let names_profile = tokens.iter().any(|token| *token == flag)
+            || tokens
+                .windows(2)
+                .any(|pair| pair[0] == "--profile" && pair[1] == profile);
+        if names_profile {
+            pids.push(pid.to_string());
+        }
+    }
+    pids
+}
+
 /// SIGTERM, never SIGKILL: the plugin releases its state-directory lock on a clean exit.
 ///
 /// The port is only a hint. Before signalling, the process command line must actually name this profile,
-/// so a port reused by something else is never killed by mistake.
-fn stop(port: u16, profile: &str) {
-    let Ok(output) = Command::new("/usr/sbin/lsof")
-        .args(["-ti", &format!("tcp:{port}")])
-        .output()
-    else {
-        return;
-    };
-    let marker = format!("--profile {profile}");
-    for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-        let Ok(command) = Command::new("/bin/ps")
-            .args(["-p", pid, "-o", "command="])
-            .output()
-        else {
-            continue;
+/// so a port reused by something else is never killed by mistake. Returns without waiting for the exit;
+/// callers that are about to touch files use [`wait_stopped`].
+fn stop(profile: &str, port: u16) -> Result<(), String> {
+    let pids = profile_pids(profile);
+    if pids.is_empty() {
+        return if is_listening(port) {
+            Err(format!(
+                "port {port} is in use but no process names --profile {profile}; stop it by hand and retry"
+            ))
+        } else {
+            Ok(())
         };
-        let command = String::from_utf8_lossy(&command.stdout);
-        if !command.contains(&marker) {
-            continue;
-        }
+    }
+    for pid in &pids {
         let _ = Command::new("/bin/kill").args(["-TERM", pid]).status();
+    }
+    Ok(())
+}
+
+fn wait_stopped(profile: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if profile_pids(profile).is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -447,6 +520,93 @@ fn create_profile(template: &str, repo: &str, progress: &dyn Fn(&str)) -> Result
     fs::create_dir_all(&state_dir).map_err(|error| error.to_string())?;
 
     Ok((name, port))
+}
+
+/// Remove a path without ever following a symlink: a profile that links a checkout into its `node_modules`
+/// must lose the link, not the checkout.
+fn remove_tree(path: &Path) -> Result<(), String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    };
+    let result = if meta.file_type().is_symlink() || !meta.is_dir() {
+        fs::remove_file(path)
+    } else {
+        fs::remove_dir_all(path)
+    };
+    result.map_err(|error| format!("cannot remove {}: {error}", path.display()))
+}
+
+/// True when `child` is a real descendant of `parent`, after resolving symlinks on both sides.
+fn is_under(child: &Path, parent: &Path) -> bool {
+    let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let (child, parent) = (resolve(child), resolve(parent));
+    child != parent && child.starts_with(&parent)
+}
+
+fn valid_profile_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+}
+
+/// Delete one configured instance: stop it, remove the profile and its log, and its state when asked.
+///
+/// The order matters. The process has to be gone before the profile directory is touched, otherwise the
+/// plugin keeps writing into a profile that no longer exists. The state directory is the only part that
+/// cannot be rebuilt, so it survives unless `purge_state` is set, and even then only when it is a plain
+/// directory under the DSH state root — a state dir pointed somewhere else is reported, never removed.
+fn remove_instance(profile: &str, purge_state: bool, progress: &dyn Fn(&str)) -> Result<String, String> {
+    if !valid_profile_name(profile) {
+        return Err(format!("not a profile name: {profile}"));
+    }
+    let Some(instance) = discover()
+        .into_iter()
+        .find(|instance| instance.profile == profile)
+    else {
+        return Err(format!("no profile named {profile} mounts dsh-superagent"));
+    };
+    let dir = profiles_dir().join(profile);
+    let manifest = fs::read_to_string(dir.join("package.json")).unwrap_or_default();
+    if !manifest.contains("dsh-superagent") {
+        return Err(format!(
+            "{} does not look like a dsh-superagent profile",
+            dir.display()
+        ));
+    }
+
+    progress("stopping it (SIGTERM)");
+    stop(profile, instance.port)?;
+    if !wait_stopped(profile, Duration::from_secs(15)) {
+        return Err(format!("{profile} is still running; nothing was deleted"));
+    }
+
+    progress("removing the profile");
+    remove_tree(&dir)?;
+
+    let mut state = format!("state kept at {}", instance.state_dir.display());
+    if instance.state_dir.starts_with(&dir) {
+        state = "state removed with the profile".into();
+    } else if purge_state {
+        let is_symlink = fs::symlink_metadata(&instance.state_dir)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink || !is_under(&instance.state_dir, &dsh_home().join("state")) {
+            state = format!(
+                "state left at {} (not a plain directory under the DSH state root)",
+                instance.state_dir.display()
+            );
+        } else {
+            progress("removing the state directory");
+            remove_tree(&instance.state_dir)?;
+            state = "state removed".into();
+        }
+    }
+
+    let log = log_for(profile);
+    if log.exists() {
+        let _ = fs::remove_file(&log);
+    }
+    Ok(format!("{profile} deleted — {state}"))
 }
 
 /// Bind the repository through the plugin's own settings API, which runs the setup check and restarts it.
@@ -663,6 +823,7 @@ struct App {
     editing: Option<String>,
     edit_allowed: String,
     edit_cli: String,
+    deleting: Option<Deletion>,
 }
 
 impl App {
@@ -686,6 +847,7 @@ impl App {
             editing: None,
             edit_allowed: String::new(),
             edit_cli: String::new(),
+            deleting: None,
         }
     }
 
@@ -713,9 +875,19 @@ impl App {
                 self.job_status.clear();
                 self.instances = discover();
                 self.last_scan = Instant::now();
+                // A deleted profile may still be the one being edited or waited on; drop that state.
+                if let Some(profile) = &self.editing {
+                    if !self.instances.iter().any(|instance| &instance.profile == profile) {
+                        self.editing = None;
+                    }
+                }
+                if let Some((profile, _, _)) = &self.pending {
+                    if !self.instances.iter().any(|instance| &instance.profile == profile) {
+                        self.pending = None;
+                    }
+                }
                 match result {
-                    Ok(text) => self.notify(text),
-                    Err(text) => self.notify(text),
+                    Ok(text) | Err(text) => self.notify(text),
                 }
             }
             None => self.job = Some(receiver),
@@ -755,6 +927,10 @@ impl eframe::App for App {
         let mut configure: Option<(String, String, String)> = None;
         let mut save_edit: Option<String> = None;
         let mut cancel_edit = false;
+        let mut request_delete: Option<String> = None;
+        let mut confirm_delete: Option<String> = None;
+        let mut cancel_delete = false;
+        let busy = self.job.is_some();
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(4.0);
@@ -764,6 +940,12 @@ impl eframe::App for App {
                     .weak()
                     .small(),
             );
+            if busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new(&self.job_status).small().weak());
+                });
+            }
             ui.add_space(6.0);
 
             if self.instances.is_empty() {
@@ -831,6 +1013,68 @@ impl eframe::App for App {
                                     action = Some(("stop", instance.profile.clone(), instance.port));
                                 }
                             });
+                            let confirming = self
+                                .deleting
+                                .as_ref()
+                                .is_some_and(|deletion| deletion.profile == instance.profile);
+                            if confirming {
+                                ui.label(
+                                    egui::RichText::new(format!("Delete {}?", instance.profile))
+                                        .strong()
+                                        .color(DANGER),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Removes {} and its log. Not reversible.",
+                                        profiles_dir().join(&instance.profile).display()
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                                if instance.running {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "It is running, so it is stopped first (SIGTERM).",
+                                        )
+                                        .weak()
+                                        .small(),
+                                    );
+                                }
+                                if let Some(deletion) = self.deleting.as_mut() {
+                                    ui.checkbox(
+                                        &mut deletion.purge_state,
+                                        "also delete the state directory",
+                                    );
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} — tickets and per-ticket checkouts",
+                                        instance.state_dir.display()
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(!busy, egui::Button::new("Cancel"))
+                                        .clicked()
+                                    {
+                                        cancel_delete = true;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !busy,
+                                            egui::Button::new(
+                                                egui::RichText::new("Delete profile")
+                                                    .color(DANGER),
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        confirm_delete = Some(instance.profile.clone());
+                                    }
+                                });
+                            } else {
                                 ui.horizontal(|ui| {
                                     if instance.running {
                                         if ui.button("Configure").clicked() {
@@ -844,33 +1088,48 @@ impl eframe::App for App {
                                         ui.add_enabled(false, egui::Button::new("Configure"))
                                             .on_hover_text("start it to edit");
                                     }
+                                    if ui
+                                        .add_enabled(
+                                            !busy,
+                                            egui::Button::new(
+                                                egui::RichText::new("Delete…").color(DANGER),
+                                            ),
+                                        )
+                                        .on_hover_text("remove this profile")
+                                        .clicked()
+                                    {
+                                        request_delete = Some(instance.profile.clone());
+                                    }
                                 });
-                                if self.editing.as_deref() == Some(instance.profile.as_str()) {
-                                    ui.horizontal(|ui| {
-                                        ui.label("allow");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut self.edit_allowed)
-                                                .hint_text("logins that may ask for work, comma separated")
-                                                .desired_width(300.0),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("cli");
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut self.edit_cli)
-                                                .hint_text("gh wrapper signed in as the agent")
-                                                .desired_width(300.0),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Save accounts").clicked() {
-                                            save_edit = Some(instance.profile.clone());
-                                        }
-                                        if ui.button("Cancel").clicked() {
-                                            cancel_edit = true;
-                                        }
-                                    });
-                                }
+                            }
+                            if !confirming
+                                && self.editing.as_deref() == Some(instance.profile.as_str())
+                            {
+                                ui.horizontal(|ui| {
+                                    ui.label("allow");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.edit_allowed)
+                                            .hint_text("logins that may ask for work, comma separated")
+                                            .desired_width(300.0),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("cli");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.edit_cli)
+                                            .hint_text("gh wrapper signed in as the agent")
+                                            .desired_width(300.0),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button("Save accounts").clicked() {
+                                        save_edit = Some(instance.profile.clone());
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        cancel_edit = true;
+                                    }
+                                });
+                            }
                         });
                         ui.add_space(4.0);
                     }
@@ -910,16 +1169,11 @@ impl eframe::App for App {
                 );
             });
             ui.horizontal(|ui| {
-                let busy = self.job.is_some();
                 if ui
                     .add_enabled(!busy, egui::Button::new("Add and start"))
                     .clicked()
                 {
                     add_clicked = true;
-                }
-                if busy {
-                    ui.spinner();
-                    ui.label(egui::RichText::new(&self.job_status).small());
                 }
             });
 
@@ -957,6 +1211,38 @@ impl eframe::App for App {
                     let tx = sender.clone();
                     thread::spawn(move || {
                         let result = add_repository(template, repo, cli, human, tx.clone());
+                        let _ = tx.send(Msg::Done(result));
+                    });
+                }
+            }
+        }
+
+        if let Some(profile) = request_delete {
+            self.deleting = Some(Deletion {
+                profile,
+                purge_state: false,
+            });
+        }
+        if cancel_delete {
+            self.deleting = None;
+        }
+        if let Some(confirmed) = confirm_delete {
+            if self
+                .deleting
+                .as_ref()
+                .is_some_and(|deletion| deletion.profile == confirmed)
+            {
+                if let Some(deletion) = self.deleting.take() {
+                    let purge = deletion.purge_state;
+                    let profile = deletion.profile;
+                    let (sender, receiver) = mpsc::channel();
+                    self.job = Some(receiver);
+                    self.job_status = format!("deleting {profile}");
+                    let tx = sender.clone();
+                    thread::spawn(move || {
+                        let result = remove_instance(&profile, purge, &|step| {
+                            let _ = tx.send(Msg::Step(step.to_string()));
+                        });
                         let _ = tx.send(Msg::Done(result));
                     });
                 }
@@ -1003,10 +1289,10 @@ impl eframe::App for App {
                 }
                 Err(error) => self.notify(error),
             },
-            Some(("stop", profile, port)) => {
-                stop(port, &profile);
-                self.notify(format!("stopping {profile} (SIGTERM)"));
-            }
+            Some(("stop", profile, port)) => match stop(&profile, port) {
+                Ok(()) => self.notify(format!("stopping {profile} (SIGTERM)")),
+                Err(error) => self.notify(error),
+            },
             _ => {}
         }
     }
@@ -1043,6 +1329,20 @@ fn main() -> eframe::Result<()> {
         let cli = rest.next().unwrap_or_default();
         match save_accounts(port, &allowed, &cli) {
             Ok(()) => println!("accounts saved on :{port}"),
+            Err(text) => {
+                eprintln!("{text}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    // `--remove <profile> [--purge]` deletes one profile without the window, for smoke tests.
+    if let Some(index) = std::env::args().position(|argument| argument == "--remove") {
+        let profile = std::env::args().nth(index + 1).unwrap_or_default();
+        let purge = std::env::args().any(|argument| argument == "--purge");
+        match remove_instance(&profile, purge, &|_| {}) {
+            Ok(text) => println!("{text}"),
             Err(text) => {
                 eprintln!("{text}");
                 std::process::exit(1);

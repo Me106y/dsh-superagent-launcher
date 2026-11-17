@@ -2,16 +2,16 @@
 
 A small native window (Rust + [egui](https://github.com/emilk/egui)) that finds every
 [DeepSeek Harness](https://github.com/deepseek-ai) profile mounting the `dsh-superagent`
-plugin and lets you start / open / stop one of them — or add a repository on a fresh
-profile and port. No auto-start: nothing here runs at login.
+plugin and lets you start / open / stop / delete one of them — or add a repository on a
+fresh profile and port. No auto-start: nothing here runs at login.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ superagent-lantern   :3080   running                          │
-│   repo  Me106y/agent-lantern                                  │
-│   cli   claude          allow  Me106y,octocat                 │
-│                              [Open]  [Stop]                   │
-└──────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│ superagent-lantern   :3080   running                                │
+│   repo  Me106y/agent-lantern                                        │
+│   cli   claude          allow  Me106y,octocat                       │
+│                     [Open]  [Stop]  [Configure]  [Delete…]          │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ## What it reads
@@ -38,8 +38,14 @@ safely either way.
 - **Open** — reads the login token the launcher printed into that log and opens
   `http://127.0.0.1:<port>/?token=<token>`.
 - **Stop** — `SIGTERM`, never `SIGKILL`: the plugin releases its state-directory lock on a
-  clean exit. The port is only a hint — the process command line must actually name this
-  profile, so a port reused by something else is never signalled by mistake.
+  clean exit. The process is found by its command line (`--profile <name>`), so a port
+  reused by something else is never signalled by mistake.
+- **Delete** — stops the instance, waits for the process to actually exit, then removes the
+  profile directory and its log. The state directory (ticket database, per-ticket
+  checkouts) is the only part that cannot be rebuilt, so it is **kept** unless the
+  confirmation's "also delete the state directory" box is ticked; even then it is only
+  removed when it is a plain directory under `<dsh home>/state` — never a symlink, never a
+  path outside it. If the process cannot be confirmed stopped, nothing is deleted.
 - **Add repository** — copies a template profile (`cp -a`), rewrites its port and state
   directory, starts it, then binds the repository through the plugin's own
   `PUT /orchestrator/api/settings/source:github`. Going through the API is deliberate:
@@ -51,7 +57,13 @@ safely either way.
 ```sh
 cargo build --release          # needs Rust 1.85+ (edition 2024)
 ./target/release/dsh-superagent-launcher
+./scripts/install-app.sh       # refresh ~/Applications/DSH Superagent.app
 ```
+
+The app bundle in `~/Applications` is what Finder and Spotlight launch, and it carries its own
+copy of the binary: `cargo build` alone never updates it. `scripts/install-app.sh` rebuilds,
+replaces that copy and re-signs the bundle ad-hoc (a replaced executable invalidates the
+signature, and macOS refuses to start it).
 
 Headless modes, used by the smoke tests:
 
@@ -59,18 +71,19 @@ Headless modes, used by the smoke tests:
 dsh-superagent-launcher --list                       # tab-separated view of the same rows
 dsh-superagent-launcher --add owner/name [--allow login,...]
 dsh-superagent-launcher --accounts <port> <logins> <cli>
+dsh-superagent-launcher --remove <profile> [--purge]
 ```
 
 ## Requirements
 
 - macOS, a DSH installation under `~/Library/Application Support/DeepSeekHarness/runtime`,
-  `node`, `curl`, `sqlite3` and `lsof` on the system paths this binary uses.
+  `node`, `curl` and `sqlite3` on the system paths this binary uses.
 - `DSH_HOME` is honoured; otherwise `~/.dsh` is assumed.
 
 ## Platform status
 
 **macOS only today.** Nothing here uses a macOS-only API — it is a plain eframe binary —
-but the install directory, the log directory, and the `open` / `lsof` / `sqlite3` invocations
+but the install directory, the log directory, and the `open` / `ps` / `sqlite3` invocations
 are hard-coded to macOS paths. A Linux port is a small `platform` module plus a runtime
 probe for the DSH install directory; the profile/port/SQLite/settings-API logic is already
 portable. The UI text is English on purpose: egui ships no CJK font and bundling a system
