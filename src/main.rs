@@ -869,10 +869,17 @@ fn add_repository(
     };
 
     let job = (|| -> Result<(), String> {
-        if !is_listening(port) {
-            progress("starting it");
-            start(&profile)?;
+        // A reused instance may have been started by an older build, with launchd's minimal PATH. Restarting
+        // it is what makes the setup check see the same environment a fresh profile would get.
+        if is_listening(port) {
+            progress("restarting it with the current environment");
+            stop(&profile, port)?;
+            if !wait_stopped(&profile, Duration::from_secs(15)) {
+                return Err(format!("{profile} is still running; nothing was changed"));
+            }
         }
+        progress("starting it");
+        start(&profile)?;
         if !wait_ready(port, &profile, Duration::from_secs(60)) {
             return Err(format!(
                 "{profile} did not become ready on {port}; see {}",

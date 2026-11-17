@@ -53,7 +53,8 @@ safely either way.
   restarts it. Editing files directly would skip that check. The agent CLI
   (`<cli> api user --jq .login`) is run first, so a broken wrapper fails before a profile
   exists; if a later step fails, the profile this job created is removed again. A profile
-  left over from an earlier failed attempt (`not configured`) is reused instead of refused.
+  left over from an earlier failed attempt (`not configured`) is restarted and reused
+  instead of refused, so a retry cannot inherit the old window's PATH.
 
 A window opened from Finder inherits launchd's PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), which
 has neither Homebrew nor a per-user bin directory. Agent CLIs are usually shell wrappers that
